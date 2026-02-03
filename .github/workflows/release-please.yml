@@ -19,6 +19,7 @@ jobs:
       - name: Run Release Please
         uses: googleapis/release-please-action@v4
         with:
-          # Use existing release-please-config.json and .release-please-manifest.json
+          # PAT required: org policy blocks GITHUB_TOKEN from creating PRs
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
