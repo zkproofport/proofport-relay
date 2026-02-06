@@ -1,6 +1,7 @@
 import Redis from 'ioredis';
 
-const REDIS_URL = process.env.REDIS_URL || 'redis://172.28.0.21:6379';
+const REDIS_URL = process.env.REDIS_URL;
+if (!REDIS_URL) throw new Error('REDIS_URL environment variable is required');
 
 let redis: Redis | null = null;
 let available = false;

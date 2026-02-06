@@ -15,15 +15,26 @@ dotenv.config();
 // Config
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT || '3100', 10);
+const nodeEnv = process.env.NODE_ENV || 'development';
+if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.CORS_ORIGIN) {
+  throw new Error('CORS_ORIGIN environment variable is required in production/staging');
+}
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.API_URL) {
+  throw new Error('API_URL environment variable is required in production/staging');
+}
 const BACKEND_URL = process.env.API_URL || 'http://localhost:4000';
-const INTERNAL_KEY = process.env.INTERNAL_API_KEY || 'dev-internal-key';
+const INTERNAL_KEY = process.env.INTERNAL_API_KEY;
+if (!INTERNAL_KEY) throw new Error('INTERNAL_API_KEY environment variable is required');
 
 const FREE_SCOPE = 'proofport:default:noop';
 const RESULT_TTL = 300; // 5 minutes
 const STATUS_TTL = 600; // 10 minutes
 const NONCE_TTL = 600;  // 10 minutes (replay prevention)
 const CALLBACK_MAX_RETRIES = 3;
+if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.RELAY_EXTERNAL_URL) {
+  throw new Error('RELAY_EXTERNAL_URL environment variable is required in production/staging');
+}
 const RELAY_EXTERNAL_URL = process.env.RELAY_EXTERNAL_URL || '';
 
 // On-chain nullifier registration (Plan 2)
@@ -188,6 +199,9 @@ async function deliverCallback(url: string, payload: CallbackPayload, attempt = 
     if (!res.ok) {
       console.error(`[Callback] All ${CALLBACK_MAX_RETRIES} attempts failed for ${url}`);
     }
+    if (res.ok) {
+      console.log(`[Callback] Successfully delivered to ${url} (attempt ${attempt})`);
+    }
   } catch (err: any) {
     if (attempt < CALLBACK_MAX_RETRIES) {
       const delay = Math.pow(2, attempt) * 500;
@@ -350,14 +364,19 @@ async function processProofRequest(body: {
 }, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
   const { clientId, circuitId, scope, inputs, callbackUrl, nonce } = body;
 
+  console.log(`[Relay] processProofRequest: clientId=${clientId}, circuitId=${circuitId}, scope=${scope || 'none'}, inputKeys=${inputs ? Object.keys(inputs).join(',') : 'none'}, callbackUrl=${callbackUrl || 'none'}, nonce=${nonce || 'none'}`);
+
   // Validate required fields
   if (!clientId || typeof clientId !== 'string') {
+    console.log('[Relay] Rejected: clientId is required');
     return { ok: false, error: 'clientId is required', code: 400 };
   }
   if (!circuitId || typeof circuitId !== 'string') {
+    console.log('[Relay] Rejected: circuitId is required');
     return { ok: false, error: 'circuitId is required', code: 400 };
   }
   if (!inputs || typeof inputs !== 'object') {
+    console.log('[Relay] Rejected: inputs object is required');
     return { ok: false, error: 'inputs object is required', code: 400 };
   }
 
@@ -365,6 +384,7 @@ async function processProofRequest(body: {
   if (nonce) {
     const seen = await cacheGet(nonceKey(nonce));
     if (seen) {
+      console.log(`[Relay] Rejected: duplicate nonce ${nonce}`);
       return { ok: false, error: 'Duplicate nonce (replay detected)', code: 409 };
     }
     await cacheSet(nonceKey(nonce), '1', NONCE_TTL);
@@ -385,6 +405,7 @@ async function processProofRequest(body: {
   if (tier === 'free') {
     const totalCredits = (plan.freeCredits ?? 0) + (plan.paidCredits ?? 0);
     if (totalCredits <= 0) {
+      console.log(`[Relay] Rejected: insufficient credits for ${clientId}`);
       return { ok: false, error: 'Insufficient credits. Purchase more at the dashboard.', code: 402 };
     }
   }
@@ -393,12 +414,14 @@ async function processProofRequest(body: {
   if (tier === 'credit') {
     const totalCredits = (plan.freeCredits ?? 0) + (plan.paidCredits ?? 0);
     if (totalCredits <= 0) {
+      console.log(`[Relay] Rejected: insufficient credits for ${clientId} (credit tier)`);
       return { ok: false, error: 'Insufficient credits', code: 402 };
     }
   }
 
   // Free tier: must have callbackUrl
   if (tier === 'free' && !callbackUrl) {
+    console.log(`[Relay] Rejected: callbackUrl required for free tier (${clientId})`);
     return { ok: false, error: 'callbackUrl is required for free tier', code: 400 };
   }
 
@@ -489,8 +512,10 @@ app.post('/api/v1/proof/request', async (req: Request, res: Response) => {
 app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
   try {
     const requestId = req.params.requestId as string;
+    console.log(`[Relay Poll] GET /api/v1/proof/${requestId} from IP: ${req.ip}`);
     const status = await getStatus(requestId);
     if (!status) {
+      console.log(`[Relay Poll] Request ${requestId} not found or expired`);
       res.status(404).json({ error: 'Request not found or expired' });
       return;
     }
@@ -510,6 +535,7 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
       }
     }
 
+    console.log(`[Relay Poll] Response for ${requestId}: status=${status.status}`);
     res.json(status);
   } catch (err: any) {
     console.error('[REST] Poll error:', err);
@@ -522,8 +548,9 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
   console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${req.ip}`);
-  console.log(`[Relay Callback] Body keys: ${Object.keys(req.body || {}).join(', ')}`);
-  console.log(`[Relay Callback] requestId: ${req.body?.requestId}, status: ${req.body?.status}, hasProof: ${!!req.body?.proof}, nullifier: ${req.body?.nullifier?.substring(0, 20)}...`);
+  const { proof: _proof, publicInputs: _pi, ...bodyWithoutProof } = req.body || {};
+  console.log(`[Relay Callback] Body (excluding proof/publicInputs):`, JSON.stringify(bodyWithoutProof));
+  console.log(`[Relay Callback] hasProof: ${!!_proof}, publicInputs: ${_pi?.length ?? 0} items`);
   try {
     const { requestId, status, proof, publicInputs, error, verifierAddress, chainId, nullifier, circuit } = req.body as {
       requestId?: string;
@@ -542,10 +569,11 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
       return;
     }
 
-    if (status !== 'completed' && status !== 'failed') {
+    if (status !== 'completed' && status !== 'failed' && status !== 'error') {
       // Intermediate status update (e.g. "generating")
       await setStatus(requestId, { status: status as ProofStatus['status'] });
       proofNs.to(`request:${requestId}`).emit('proof:status', { requestId, status });
+      console.log(`[Relay Callback] Intermediate status update: ${requestId} -> ${status}`);
       res.json({ received: true });
       return;
     }
@@ -683,6 +711,7 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
 
     console.log(`[Relay] Proof result received: ${requestId} (status=${status})`);
     res.json({ received: true });
+    console.log(`[Relay Callback] Successfully processed callback for ${requestId} (status=${status}, circuit=${circuit || 'unknown'})`);
   } catch (err: any) {
     console.error('[REST] Callback error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -695,6 +724,7 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
 app.get('/api/v1/nullifier/:hash', async (req: Request, res: Response) => {
   try {
     const hash = req.params.hash as string;
+    console.log(`[Relay] GET /api/v1/nullifier/${hash} from IP: ${req.ip}`);
     if (!hash || !hash.startsWith('0x')) {
       res.status(400).json({ error: 'Invalid nullifier hash (must start with 0x)' });
       return;
@@ -711,6 +741,7 @@ app.get('/api/v1/nullifier/:hash', async (req: Request, res: Response) => {
     const [registeredAt, scope, circuitId] = await registry.getNullifierInfo(hash);
     const registered = BigInt(registeredAt) > 0n;
 
+    console.log(`[Relay] Nullifier ${hash}: registered=${registered}`);
     res.json({
       registered,
       registeredAt: registered ? Number(registeredAt) : null,
@@ -803,6 +834,7 @@ proofNs.on('connection', (socket: Socket) => {
 
   // Allow client to subscribe to an existing request (e.g. after reconnect)
   socket.on('proof:subscribe', async (data: { requestId?: string }) => {
+    console.log(`[Socket.IO] proof:subscribe from ${socket.id}: requestId=${data.requestId || 'none'}`);
     if (!data.requestId) {
       socket.emit('proof:error', { error: 'requestId is required' });
       return;
@@ -814,6 +846,7 @@ proofNs.on('connection', (socket: Socket) => {
     const buffered = await cacheGet(resultKey(data.requestId));
     if (buffered) {
       const result: ProofResult = JSON.parse(buffered);
+      console.log(`[Socket.IO] Replaying buffered result for ${data.requestId} (status=${result.status})`);
       socket.emit('proof:result', result);
       return;
     }
@@ -821,12 +854,14 @@ proofNs.on('connection', (socket: Socket) => {
     // Otherwise send current status
     const status = await getStatus(data.requestId);
     if (status) {
+      console.log(`[Socket.IO] Current status for ${data.requestId}: ${status.status}`);
       socket.emit('proof:status', {
         requestId: data.requestId,
         status: status.status,
         deepLink: status.deepLink,
       });
     } else {
+      console.log(`[Socket.IO] Request not found: ${data.requestId}`);
       socket.emit('proof:error', { error: 'Request not found or expired', requestId: data.requestId });
     }
   });

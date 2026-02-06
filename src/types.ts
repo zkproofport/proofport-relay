@@ -22,7 +22,7 @@ export interface ProofRequest {
 
 export interface ProofResult {
   requestId: string;
-  status: 'completed' | 'failed';
+  status: 'completed' | 'failed' | 'error';
   proof?: string;
   publicInputs?: string[];
   error?: string;
@@ -35,7 +35,7 @@ export interface ProofResult {
 
 export interface ProofStatus {
   requestId: string;
-  status: 'pending' | 'generating' | 'completed' | 'failed' | 'expired';
+  status: 'pending' | 'generating' | 'completed' | 'failed' | 'error' | 'expired';
   proof?: string;
   publicInputs?: string[];
   error?: string;
@@ -52,7 +52,7 @@ export interface ProofStatus {
 
 export interface CallbackPayload {
   requestId: string;
-  status: 'completed' | 'failed';
+  status: 'completed' | 'failed' | 'error';
   proof?: string;
   publicInputs?: string[];
   error?: string;
