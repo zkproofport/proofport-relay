@@ -1,10 +1,10 @@
 # proofport-relay
 
-Express + Socket.IO relay server for real-time proof request sessions between dApps and the ProofPort mobile app. The relay bridges web applications via the SDK and the mobile proof generator, managing proof request lifecycles with real-time status updates.
+Express + Socket.IO relay server for real-time proof request sessions between dApps and the Proofport mobile app. The relay bridges web applications via the SDK and the mobile proof generator, managing proof request lifecycles with real-time status updates.
 
 ## Overview
 
-ProofPort Relay is the communication hub of the ProofPort zero-knowledge proof infrastructure. It:
+Proofport Relay is the communication hub of the Proofport zero-knowledge proof infrastructure. It:
 
 - Manages proof request sessions with unique request IDs
 - Provides REST and WebSocket (Socket.IO) APIs for real-time bidirectional communication
@@ -18,7 +18,7 @@ ProofPort Relay is the communication hub of the ProofPort zero-knowledge proof i
 
 ```
 ┌─────────────────┐          ┌──────────────────┐          ┌──────────────────┐
-│  dApp SDK       │          │  ProofPort Relay │          │  ProofPort App   │
+│  dApp SDK       │          │  Proofport Relay │          │  Proofport App   │
 │  (Web/REST)     │◄────────►│   Express +      │◄────────►│   (Mobile)       │
 │                 │          │   Socket.IO      │          │                  │
 └─────────────────┘          └──────────────────┘          └──────────────────┘

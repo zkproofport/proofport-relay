@@ -1,4 +1,4 @@
-# ProofPort Relay - Production Dockerfile
+# Proofport Relay - Production Dockerfile
 # Multi-stage build for minimal image size
 
 # --- Stage 1: Install dependencies ---

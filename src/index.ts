@@ -538,7 +538,7 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// REST: POST /api/v1/proof/callback  (ZKProofPort app posts result here)
+// REST: POST /api/v1/proof/callback  (ZKProofport app posts result here)
 // ---------------------------------------------------------------------------
 app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
   console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${req.ip}`);

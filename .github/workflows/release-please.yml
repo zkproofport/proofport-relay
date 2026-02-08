@@ -1,4 +1,4 @@
-# ZKProofPort Relay - Release Please Workflow
+# ZKProofport Relay - Release Please Workflow
 # Automatically create release PR and publish GitHub Release when pushed to main branch
 
 name: Release Please
