@@ -5,8 +5,9 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
+import jwt from 'jsonwebtoken';
 import { initRedis, cacheSet, cacheGet, cacheSetNX } from './redis';
-import type { PlanInfo, ProofRequest, ProofResult, ProofStatus, Tier, CallbackPayload } from './types';
+import type { PlanInfo, ProofRequest, ProofResult, ProofStatus, Tier } from './types';
 import { ethers } from 'ethers';
 
 dotenv.config();
@@ -26,12 +27,13 @@ if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.API_URL)
 const BACKEND_URL = process.env.API_URL || 'http://localhost:4000';
 const INTERNAL_KEY = process.env.INTERNAL_API_KEY;
 if (!INTERNAL_KEY) throw new Error('INTERNAL_API_KEY environment variable is required');
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
 
 const FREE_SCOPE = 'proofport:default:noop';
 const RESULT_TTL = 300; // 5 minutes
 const STATUS_TTL = 600; // 10 minutes
 const NONCE_TTL = 600;  // 10 minutes (replay prevention)
-const CALLBACK_MAX_RETRIES = 3;
 if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.RELAY_EXTERNAL_URL) {
   throw new Error('RELAY_EXTERNAL_URL environment variable is required in production/staging');
 }
@@ -75,6 +77,33 @@ const io = new Server(httpServer, {
 });
 
 const proofNs = io.of('/proof');
+
+// ---------------------------------------------------------------------------
+// JWT verification
+// ---------------------------------------------------------------------------
+interface ClientJwtPayload {
+  sub: string;      // clientId
+  type: 'client';
+  dappId: string;
+  customerId: string;
+  tier: string;
+}
+
+function verifyClientToken(token: string): ClientJwtPayload | null {
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET as string) as unknown as ClientJwtPayload;
+    if (decoded.type !== 'client') return null;
+    return decoded;
+  } catch (err) {
+    return null;
+  }
+}
+
+function extractBearerToken(req: Request): string | null {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return null;
+  return auth.slice(7);
+}
 
 // ---------------------------------------------------------------------------
 // Backend API client
@@ -146,9 +175,6 @@ function resultKey(requestId: string) {
 function nonceKey(nonce: string) {
   return `proof:nonce:${nonce}`;
 }
-function callbackKey(requestId: string) {
-  return `proof:callback:${requestId}`;
-}
 function tierKey(requestId: string) {
   return `proof:tier:${requestId}`;
 }
@@ -177,44 +203,6 @@ async function setStatus(requestId: string, status: Partial<ProofStatus>): Promi
 async function getStatus(requestId: string): Promise<ProofStatus | null> {
   const raw = await cacheGet(statusKey(requestId));
   return raw ? JSON.parse(raw) : null;
-}
-
-// ---------------------------------------------------------------------------
-// Callback proxy with retries
-// ---------------------------------------------------------------------------
-async function deliverCallback(url: string, payload: CallbackPayload, attempt = 1): Promise<void> {
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!res.ok && attempt < CALLBACK_MAX_RETRIES) {
-      const delay = Math.pow(2, attempt) * 500;
-      console.warn(`[Callback] Attempt ${attempt} failed (${res.status}), retrying in ${delay}ms`);
-      await sleep(delay);
-      return deliverCallback(url, payload, attempt + 1);
-    }
-    if (!res.ok) {
-      console.error(`[Callback] All ${CALLBACK_MAX_RETRIES} attempts failed for ${url}`);
-    }
-    if (res.ok) {
-      console.log(`[Callback] Successfully delivered to ${url} (attempt ${attempt})`);
-    }
-  } catch (err: any) {
-    if (attempt < CALLBACK_MAX_RETRIES) {
-      const delay = Math.pow(2, attempt) * 500;
-      console.warn(`[Callback] Attempt ${attempt} error (${err.message}), retrying in ${delay}ms`);
-      await sleep(delay);
-      return deliverCallback(url, payload, attempt + 1);
-    }
-    console.error(`[Callback] All ${CALLBACK_MAX_RETRIES} attempts failed for ${url}:`, err.message);
-  }
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 // ---------------------------------------------------------------------------
@@ -359,12 +347,11 @@ async function processProofRequest(body: {
   circuitId?: string;
   scope?: string;
   inputs?: Record<string, unknown>;
-  callbackUrl?: string;
   nonce?: string;
 }, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
-  const { clientId, circuitId, scope, inputs, callbackUrl, nonce } = body;
+  const { clientId, circuitId, scope, inputs, nonce } = body;
 
-  console.log(`[Relay] processProofRequest: clientId=${clientId}, circuitId=${circuitId}, scope=${scope || 'none'}, inputKeys=${inputs ? Object.keys(inputs).join(',') : 'none'}, callbackUrl=${callbackUrl || 'none'}, nonce=${nonce || 'none'}`);
+  console.log(`[Relay] processProofRequest: clientId=${clientId}, circuitId=${circuitId}, scope=${scope || 'none'}, inputKeys=${inputs ? Object.keys(inputs).join(',') : 'none'}, nonce=${nonce || 'none'}`);
 
   // Validate required fields
   if (!clientId || typeof clientId !== 'string') {
@@ -419,11 +406,6 @@ async function processProofRequest(body: {
     }
   }
 
-  // Free tier: must have callbackUrl
-  if (tier === 'free' && !callbackUrl) {
-    console.log(`[Relay] Rejected: callbackUrl required for free tier (${clientId})`);
-    return { ok: false, error: 'callbackUrl is required for free tier', code: 400 };
-  }
 
   // Scope injection: free tier gets noop scope
   const effectiveScope = tier === 'free' ? FREE_SCOPE : (scope || FREE_SCOPE);
@@ -431,8 +413,7 @@ async function processProofRequest(body: {
   const requestId = uuidv4();
   const now = new Date().toISOString();
 
-  // Deep link callbackUrl points to the relay so the app sends results here.
-  // The original dApp callbackUrl is stored separately and forwarded after receipt.
+  // Deep link callbackUrl always points to the relay so the app sends results here.
   const relayCallbackUrl = `${RELAY_EXTERNAL_URL || relayBaseUrl || `http://localhost:${PORT}`}/api/v1/proof/callback`;
 
   const proofRequest: ProofRequest = {
@@ -445,10 +426,7 @@ async function processProofRequest(body: {
     createdAt: now,
   };
 
-  // Store metadata for later callback delivery and credit deduction
-  if (callbackUrl) {
-    await cacheSet(callbackKey(requestId), callbackUrl, STATUS_TTL);
-  }
+  // Store metadata for credit deduction
   await cacheSet(tierKey(requestId), tier, STATUS_TTL);
   await cacheSet(clientKey(requestId), clientId, STATUS_TTL);
   await cacheSet(circuitKey(requestId), circuitId, STATUS_TTL);
@@ -468,7 +446,6 @@ async function processProofRequest(body: {
 
   console.log(`[Relay] Proof request created: ${requestId} (tier=${tier}, circuit=${circuitId})`);
   console.log(`[Relay] Deep link callbackUrl: ${relayCallbackUrl}`);
-  console.log(`[Relay] dApp callbackUrl stored: ${callbackUrl || 'none'}`);
   console.log(`[Relay] Deep link data keys: ${Object.keys(proofRequest).join(', ')}`);
 
   // Free tier: deduct 1 credit immediately at request time
@@ -488,8 +465,25 @@ async function processProofRequest(body: {
 // ---------------------------------------------------------------------------
 app.post('/api/v1/proof/request', async (req: Request, res: Response) => {
   try {
+    const bearerToken = extractBearerToken(req);
+    if (!bearerToken) {
+      console.log('[REST] No Authorization header — JWT required');
+      res.status(401).json({ error: 'Authorization header with Bearer token is required' });
+      return;
+    }
+
+    const payload = verifyClientToken(bearerToken);
+    if (!payload) {
+      console.log('[REST] JWT verification failed');
+      res.status(401).json({ error: 'Invalid or expired token' });
+      return;
+    }
+
+    const clientId = payload.sub;
+    console.log(`[REST] JWT authenticated: clientId=${clientId}, dappId=${payload.dappId}, tier=${payload.tier}`);
+
     const relayBaseUrl = `${req.protocol}://${req.get('host')}`;
-    const result = await processProofRequest(req.body, relayBaseUrl);
+    const result = await processProofRequest({ ...req.body, clientId }, relayBaseUrl);
     if (!result.ok) {
       res.status(result.code).json({ error: result.error });
       return;
@@ -566,6 +560,14 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
 
     if (!requestId || !status) {
       res.status(400).json({ error: 'requestId and status are required' });
+      return;
+    }
+
+    // Validate requestId was created by this relay (exists in Redis)
+    const existingStatus = await getStatus(requestId);
+    if (!existingStatus) {
+      console.log(`[Relay Callback] Rejected: unknown requestId ${requestId}`);
+      res.status(404).json({ error: 'Unknown or expired requestId' });
       return;
     }
 
@@ -689,26 +691,6 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
     // Emit via Socket.IO
     proofNs.to(`request:${requestId}`).emit('proof:result', proofResult);
 
-    // Deliver to callback URL if registered
-    const cbUrl = await cacheGet(callbackKey(requestId));
-    if (cbUrl) {
-      const payload: CallbackPayload = {
-        requestId,
-        status,
-        proof,
-        publicInputs,
-        error,
-        verifierAddress,
-        chainId,
-        circuit,
-        ...nullifierInfo,
-      };
-      // Fire and forget with retries
-      deliverCallback(cbUrl, payload).catch((e) =>
-        console.error(`[Callback] Delivery error for ${requestId}:`, e)
-      );
-    }
-
     console.log(`[Relay] Proof result received: ${requestId} (status=${status})`);
     res.json({ received: true });
     console.log(`[Relay Callback] Successfully processed callback for ${requestId} (status=${status}, circuit=${circuit || 'unknown'})`);
@@ -755,6 +737,42 @@ app.get('/api/v1/nullifier/:hash', async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+// REST: POST /api/v1/auth/token (proxy to backend API)
+// ---------------------------------------------------------------------------
+app.post('/api/v1/auth/token', async (req: Request, res: Response) => {
+  try {
+    const { client_id, api_key } = req.body as { client_id?: string; api_key?: string };
+
+    if (!client_id || !api_key) {
+      res.status(400).json({ error: 'client_id and api_key are required' });
+      return;
+    }
+
+    console.log(`[Relay Auth] Token request for client_id=${client_id}`);
+
+    const response = await fetch(`${BACKEND_URL}/api/auth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id, api_key }),
+    });
+
+    const data = await response.json() as any;
+
+    if (!response.ok) {
+      console.log(`[Relay Auth] Backend rejected: ${response.status} ${data.error || ''}`);
+      res.status(response.status).json(data);
+      return;
+    }
+
+    console.log(`[Relay Auth] Token issued for client_id=${client_id}`);
+    res.json(data);
+  } catch (err: any) {
+    console.error('[Relay Auth] Proxy error:', err.message);
+    res.status(502).json({ error: 'Authentication service unavailable' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Health check
 // ---------------------------------------------------------------------------
 app.get('/health', (_req: Request, res: Response) => {
@@ -769,17 +787,26 @@ app.get('/health', (_req: Request, res: Response) => {
 // Socket.IO /proof namespace
 // ---------------------------------------------------------------------------
 
-// Auth middleware: validate clientId, reject free tier
+// Auth middleware: validate JWT token, reject free tier
 proofNs.use(async (socket: Socket, next) => {
-  const clientId = socket.handshake.auth?.clientId as string | undefined;
-  if (!clientId) {
-    return next(new Error('Authentication error: clientId required'));
+  const token = socket.handshake.auth?.token as string | undefined;
+
+  if (!token) {
+    return next(new Error('Authentication error: JWT token required'));
   }
+
+  const payload = verifyClientToken(token);
+  if (!payload) {
+    return next(new Error('Authentication error: invalid or expired token'));
+  }
+
+  const clientId = payload.sub;
+  console.log(`[Socket.IO] JWT authenticated: clientId=${clientId}, dappId=${payload.dappId}`);
 
   try {
     const plan = await getPlan(clientId);
     if (plan.tier === 'free') {
-      return next(new Error('Free tier must use REST API with callbackUrl'));
+      return next(new Error('Free tier must use REST API with polling'));
     }
     // Attach plan to socket data for later use
     (socket as any).plan = plan;
@@ -801,7 +828,6 @@ proofNs.on('connection', (socket: Socket) => {
     circuitId?: string;
     scope?: string;
     inputs?: Record<string, unknown>;
-    callbackUrl?: string;
     nonce?: string;
   }) => {
     try {
