@@ -49,18 +49,3 @@ export interface ProofStatus {
   createdAt: string;
   updatedAt: string;
 }
-
-export interface CallbackPayload {
-  requestId: string;
-  status: 'completed' | 'failed' | 'error';
-  proof?: string;
-  publicInputs?: string[];
-  error?: string;
-  verifierAddress?: string;
-  chainId?: number;
-  nullifier?: string;
-  scope?: string;
-  circuit?: string;
-  onChainStatus?: string;
-  txHash?: string;
-}

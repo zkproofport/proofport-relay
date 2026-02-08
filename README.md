@@ -81,30 +81,41 @@ Environment variables (see `.env.example`):
 | `REDIS_URL` | `redis://172.28.0.21:6379` | Redis connection string |
 | `BACKEND_API_URL` | `http://172.28.0.11:3200` | Backend API for plan/credit validation |
 | `BACKEND_API_KEY` | `dev-internal-api-key` | API key for backend authentication |
+| `JWT_SECRET` | (required) | JWT secret for token verification (REQUIRED for authentication) |
 | `NODE_ENV` | `development` | Environment mode |
 
 ## API Reference
+
+### Authentication
+
+**JWT Token Authentication is REQUIRED.** All requests must include `Authorization: Bearer <token>` header with a valid JWT token from the API server. The token payload must contain `{ sub: clientId, type: 'client', dappId, customerId, tier }`. The `clientId` is extracted from the token's `sub` field.
+
+**Important:** The `clientId` field in the request body (REST) or connection auth (Socket.IO) is ignored. Client identity is always determined from the JWT token.
 
 ### REST Endpoints
 
 #### POST /api/v1/proof/request
 Create a new proof request session.
 
-**Request:**
-```json
-{
-  "clientId": "client_123",
-  "circuitId": "coinbase_attestation",
-  "scope": "proofport:kyc",
-  "inputs": {
-    "account": "0x1234...",
-    "signalHash": "0x5678...",
-    "attesterRoot": "0x9abc..."
-  },
-  "callbackUrl": "https://myapp.com/webhook/proof",
-  "nonce": "unique_idempotency_key"
-}
+**Request (with JWT token):**
+```bash
+curl -X POST http://relay:4001/api/v1/proof/request \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "circuitId": "coinbase_attestation",
+    "scope": "proofport:kyc",
+    "inputs": {
+      "account": "0x1234...",
+      "signalHash": "0x5678...",
+      "attesterRoot": "0x9abc..."
+    },
+    "callbackUrl": "https://myapp.com/webhook/proof",
+    "nonce": "unique_idempotency_key"
+  }'
 ```
+
+**Note:** The `clientId` field in the request body is optional and ignored. Client identity is always extracted from the JWT token's `sub` field.
 
 **Response (201):**
 ```json
@@ -119,6 +130,7 @@ Create a new proof request session.
 **Status Codes:**
 - `201`: Request created successfully
 - `400`: Missing required fields or invalid inputs
+- `401`: Invalid or expired JWT token
 - `402`: Insufficient credits (credit tier)
 - `403`: Invalid or unknown clientId
 - `409`: Duplicate nonce (replay detected)
@@ -227,21 +239,22 @@ Health check endpoint.
 
 ### WebSocket Events (Socket.IO /proof namespace)
 
-**Connection:**
+**Connection (with JWT token):**
 ```javascript
-const socket = io('http://relay:3100', {
+const socket = io('http://relay:4001', {
   path: '/socket.io',
   namespace: '/proof',
   auth: {
-    clientId: 'client_123'
+    token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
   }
 });
 ```
 
 **Authentication:**
-- Clients must provide `clientId` in connection auth
+- Clients MUST provide `token` (JWT) in connection auth
+- JWT token is verified; `clientId` is extracted from token's `sub` field
 - Free tier clients cannot use Socket.IO (REST only)
-- Invalid clientId rejects connection
+- Invalid or missing token rejects connection
 
 #### Event: proof:request
 Client initiates proof request.
@@ -435,13 +448,31 @@ Mobile app decodes and extracts fields for proof generation.
 
 ### Backend (dApp SDK)
 
-**REST Example (Node.js):**
+**REST Example with JWT Token (Recommended):**
 ```javascript
-const response = await fetch('http://relay:3100/api/v1/proof/request', {
+// First, obtain JWT token from API server
+const authResponse = await fetch('http://api:4000/api/auth/token', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
+  headers: {
+    'Content-Type': 'application/json',
+    'x-api-key': 'your_api_key'
+  },
   body: JSON.stringify({
-    clientId: 'my_app_123',
+    dappId: 'your_dapp_id',
+    customerId: 'your_customer_id'
+  })
+});
+
+const { token } = await authResponse.json();
+
+// Use token for relay requests
+const response = await fetch('http://relay:4001/api/v1/proof/request', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`
+  },
+  body: JSON.stringify({
     circuitId: 'coinbase_attestation',
     scope: 'proofport:kyc',
     inputs: {
@@ -461,11 +492,15 @@ const { requestId, deepLink, status, pollUrl } = await response.json();
 // Poll pollUrl every 2 seconds
 ```
 
-**Socket.IO Example:**
+
+**Socket.IO Example with JWT Token (Recommended):**
 ```javascript
-const socket = io('http://relay:3100', {
+// First, obtain JWT token from API server (same as REST example above)
+const { token } = await authResponse.json();
+
+const socket = io('http://relay:4001', {
   namespace: '/proof',
-  auth: { clientId: 'my_app_123' }
+  auth: { token }
 });
 
 socket.on('connect', () => {
@@ -498,6 +533,7 @@ socket.on('proof:error', (err) => {
   console.error(`Error: ${err.error} (code: ${err.code})`);
 });
 ```
+
 
 ### Mobile App (Proof Generation)
 
@@ -658,7 +694,8 @@ interface ProofResult {
 
 | Scenario | HTTP Status | Error Message |
 |----------|-------------|---------------|
-| Missing clientId | 400 | `clientId is required` |
+| Missing JWT token | 401 | `Authorization header required` |
+| Invalid JWT token | 401 | `Invalid or expired JWT token` |
 | Missing circuitId | 400 | `circuitId is required` |
 | Missing inputs | 400 | `inputs object is required` |
 | Invalid clientId | 403 | `Invalid or unknown clientId` |
@@ -667,7 +704,7 @@ interface ProofResult {
 | Replay detected | 409 | `Duplicate nonce (replay detected)` |
 | Request expired | 404 | `Request not found or expired` |
 | Free tier on Socket.IO | Error | `Free tier must use REST API with callbackUrl` |
-| Missing Socket.IO clientId | Error | `Authentication error: clientId required` |
+| Missing Socket.IO token | Error | `Authentication error: JWT token required` |
 
 ## Performance
 
