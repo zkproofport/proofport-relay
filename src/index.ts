@@ -15,18 +15,20 @@ dotenv.config();
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const PORT = parseInt(process.env.PORT || '3100', 10);
+const PORT = parseInt(process.env.PORT || '4001', 10);
 const nodeEnv = process.env.NODE_ENV || 'development';
 if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.CORS_ORIGIN) {
   throw new Error('CORS_ORIGIN environment variable is required in production/staging');
 }
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const CORS_ORIGIN: string | string[] = process.env.CORS_ORIGIN
+  ? (process.env.CORS_ORIGIN === '*' ? '*' : process.env.CORS_ORIGIN.split(',').map(s => s.trim()))
+  : '*';
 if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.API_URL) {
   throw new Error('API_URL environment variable is required in production/staging');
 }
 const BACKEND_URL = process.env.API_URL || 'http://localhost:4000';
-const INTERNAL_KEY = process.env.INTERNAL_API_KEY;
-if (!INTERNAL_KEY) throw new Error('INTERNAL_API_KEY environment variable is required');
+if (!process.env.INTERNAL_API_KEY) throw new Error('INTERNAL_API_KEY environment variable is required');
+const INTERNAL_KEY: string = process.env.INTERNAL_API_KEY;
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
 
@@ -42,7 +44,8 @@ const RELAY_EXTERNAL_URL = process.env.RELAY_EXTERNAL_URL || '';
 // On-chain nullifier registration (Plan 2)
 const RELAY_PRIVATE_KEY = process.env.RELAY_PRIVATE_KEY || '';
 const NULLIFIER_REGISTRY_ADDRESS = process.env.NULLIFIER_REGISTRY_ADDRESS || '';
-const CHAIN_RPC_URL = process.env.CHAIN_RPC_URL || 'https://sepolia.base.org';
+const CHAIN_RPC_URL = process.env.CHAIN_RPC_URL;
+if (!CHAIN_RPC_URL) throw new Error('CHAIN_RPC_URL environment variable is required');
 
 const NULLIFIER_REGISTRY_ABI = [
   'function verifyAndRegister(bytes32 _circuitId, bytes calldata _proof, bytes32[] calldata _publicInputs) external returns (uint8 status, bytes32 nullifier, bytes32 scope)',
