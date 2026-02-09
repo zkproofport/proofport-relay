@@ -53,7 +53,7 @@ npm install
 npm run dev
 ```
 
-Server runs on `http://0.0.0.0:3100` with hot reload via `tsx`.
+Server runs on `http://0.0.0.0:4001` with hot reload via `tsx`.
 
 ### Production Build
 
@@ -76,12 +76,16 @@ Environment variables (see `.env.example`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `3100` | Server port |
+| `PORT` | `4001` | Server port |
 | `CORS_ORIGIN` | `*` | CORS allowed origins |
-| `REDIS_URL` | `redis://172.28.0.21:6379` | Redis connection string |
-| `BACKEND_API_URL` | `http://172.28.0.11:3200` | Backend API for plan/credit validation |
-| `BACKEND_API_KEY` | `dev-internal-api-key` | API key for backend authentication |
-| `JWT_SECRET` | (required) | JWT secret for token verification (REQUIRED for authentication) |
+| `REDIS_URL` | (required) | Redis connection string |
+| `API_URL` | (required) | Backend API URL (e.g., `http://api:4000`) |
+| `INTERNAL_API_KEY` | (required) | Internal API key for backend authentication |
+| `JWT_SECRET` | (required) | JWT secret for token verification |
+| `RELAY_EXTERNAL_URL` | (required for production) | External relay URL for deep link callbacks |
+| `RELAY_PRIVATE_KEY` | (required) | Ethereum private key for on-chain nullifier registration |
+| `NULLIFIER_REGISTRY_ADDRESS` | (required) | NullifierRegistry contract address |
+| `CHAIN_RPC_URL` | (required) | Base Sepolia RPC endpoint |
 | `NODE_ENV` | `development` | Environment mode |
 
 ## API Reference
@@ -176,7 +180,7 @@ After completion:
 
 **Polling Intervals:**
 - Free tier: 2-3 seconds (backend rate limit)
-- Credit/Unlimited: 1-2 seconds
+- Credit/Plan1/Plan2: 1-2 seconds
 
 #### POST /api/v1/proof/callback
 Receive proof completion callback from mobile app.
@@ -359,17 +363,19 @@ socket.on('proof:result', (result) => {
 
 ## Tier System
 
-| Tier | Rate Limit | Session TTL | Credit Deduction | Scope Control | Callback |
-|------|-----------|-------------|------------------|---------------|----------|
-| `free` | Backend enforced | 10 min | None | Forced `proofport:default:noop` | Required |
-| `credit` | 100 req/min | 10 min | 1 per completion | User-provided | Optional |
-| `unlimited` | Unlimited | 10 min | None | User-provided | Optional |
+| Tier | Rate Limit | Session TTL | Credit Deduction | Scope Control | On-Chain Registration | Callback |
+|------|-----------|-------------|------------------|---------------|----------------------|----------|
+| `free` | Backend enforced | 10 min | 1 per request | Forced `proofport:default:noop` | No | Required |
+| `credit` | 100 req/min | 10 min | 1 per completion | User-provided | No | Optional |
+| `plan1` | Plan-based | 10 min | Plan-based | User-provided | No | Optional |
+| `plan2` | Plan-based | 10 min | Plan-based | User-provided | Yes (nullifier on-chain) | Optional |
 
 **Tier Behavior:**
 
-- **Free**: Must provide `callbackUrl` (Socket.IO denied). Cannot use custom scope. No credits deducted.
+- **Free**: Must provide `callbackUrl` (Socket.IO denied). Cannot use custom scope. 1 credit deducted per request.
 - **Credit**: Can use Socket.IO and REST. Uses custom scope. 1 credit deducted on successful proof completion.
-- **Unlimited**: Can use Socket.IO and REST. Uses custom scope. No credit deduction.
+- **Plan1**: Can use Socket.IO and REST. Uses custom scope. Credits based on plan.
+- **Plan2**: Same as Plan1 plus on-chain nullifier registration via `RELAY_PRIVATE_KEY`.
 
 **Client Plan Validation:**
 Relay calls backend `GET /internal/plan/{clientId}` to validate tier and check credit balance.
@@ -552,7 +558,7 @@ const result = {
   publicInputs: [publicInput1, publicInput2]
 };
 
-await fetch('http://relay:3100/api/v1/proof/callback', {
+await fetch('http://relay:4001/api/v1/proof/callback', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify(result)
@@ -584,13 +590,13 @@ app.post('/webhook/proof', (req, res) => {
 ### Health Check
 
 ```bash
-curl http://0.0.0.0:3100/health
+curl http://0.0.0.0:4001/health
 ```
 
 ### View Status
 
 ```bash
-curl http://0.0.0.0:3100/api/v1/proof/{requestId}
+curl http://0.0.0.0:4001/api/v1/proof/{requestId}
 ```
 
 ### Logs
@@ -614,25 +620,24 @@ docker build -t proofport-relay .
 
 **Run:**
 ```bash
-docker run -p 3100:3100 \
+docker run -p 4001:4001 \
   -e REDIS_URL=redis://redis:6379 \
-  -e BACKEND_API_URL=http://backend:3200 \
-  -e BACKEND_API_KEY=secret \
+  -e API_URL=http://api:4000 \
+  -e INTERNAL_API_KEY=secret \
   proofport-relay
 ```
 
 **Docker Compose:**
 ```yaml
-version: '3.8'
 services:
   relay:
     image: proofport-relay
     ports:
-      - '3100:3100'
+      - '4001:4001'
     environment:
       REDIS_URL: redis://redis:6379
-      BACKEND_API_URL: http://backend:3200
-      BACKEND_API_KEY: ${BACKEND_API_KEY}
+      API_URL: http://api:4000
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
     depends_on:
       - redis
 
@@ -647,7 +652,7 @@ services:
 Key types exported from `src/types.ts`:
 
 ```typescript
-type Tier = 'free' | 'credit' | 'unlimited';
+type Tier = 'free' | 'credit' | 'plan1' | 'plan2';
 
 interface PlanInfo {
   clientId: string;
