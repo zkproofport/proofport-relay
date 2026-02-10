@@ -692,7 +692,10 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
     }
 
     // Emit via Socket.IO
-    proofNs.to(`request:${requestId}`).emit('proof:result', proofResult);
+    const room = `request:${requestId}`;
+    const sockets = await proofNs.in(room).fetchSockets();
+    console.log(`[Socket.IO] Emitting proof:result to room=${room}, sockets=${sockets.length}`);
+    proofNs.to(room).emit('proof:result', proofResult);
 
     console.log(`[Relay] Proof result received: ${requestId} (status=${status})`);
     res.json({ received: true });
@@ -790,16 +793,18 @@ app.get('/health', (_req: Request, res: Response) => {
 // Socket.IO /proof namespace
 // ---------------------------------------------------------------------------
 
-// Auth middleware: validate JWT token, reject free tier
+// Auth middleware: validate JWT token
 proofNs.use(async (socket: Socket, next) => {
   const token = socket.handshake.auth?.token as string | undefined;
 
   if (!token) {
+    console.warn(`[Socket.IO] Connection rejected: no JWT token (socket=${socket.id})`);
     return next(new Error('Authentication error: JWT token required'));
   }
 
   const payload = verifyClientToken(token);
   if (!payload) {
+    console.warn(`[Socket.IO] Connection rejected: invalid/expired JWT (socket=${socket.id})`);
     return next(new Error('Authentication error: invalid or expired token'));
   }
 
@@ -808,9 +813,6 @@ proofNs.use(async (socket: Socket, next) => {
 
   try {
     const plan = await getPlan(clientId);
-    if (plan.tier === 'free') {
-      return next(new Error('Free tier must use REST API with polling'));
-    }
     // Attach plan to socket data for later use
     (socket as any).plan = plan;
     (socket as any).clientId = clientId;
