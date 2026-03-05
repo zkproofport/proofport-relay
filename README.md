@@ -8,36 +8,38 @@ Proofport Relay is the communication hub of the Proofport zero-knowledge proof i
 
 - Manages proof request sessions with unique request IDs
 - Provides REST and WebSocket (Socket.IO) APIs for real-time bidirectional communication
-- Handles tier-based rate limiting and credit deduction
-- Supports callback webhooks for proof delivery
+- Authenticates requests via challenge-signature (EIP-191) instead of JWT
+- Applies IP-based rate limiting to challenge and proof request endpoints
+- Computes and stores SHA256 inputs hash for integrity verification
 - Implements replay prevention via nonce tracking
-- Falls back to in-memory storage when Redis is unavailable
 - Generates deep links for mobile app invocation
 
 ## Architecture
 
 ```
-┌─────────────────┐          ┌──────────────────┐          ┌──────────────────┐
-│  dApp SDK       │          │  Proofport Relay │          │  Proofport App   │
-│  (Web/REST)     │◄────────►│   Express +      │◄────────►│   (Mobile)       │
-│                 │          │   Socket.IO      │          │                  │
-└─────────────────┘          └──────────────────┘          └──────────────────┘
-                                     │
-                                     ▼
-                           ┌──────────────────┐
-                           │  Redis Cache     │
-                           │  (w/ fallback)   │
-                           └──────────────────┘
++-----------------+          +------------------+          +------------------+
+|  dApp SDK       |          |  Proofport Relay |          |  Proofport App   |
+|  (Web/REST)     |<-------->|   Express +      |<-------->|   (Mobile)       |
+|                 |          |   Socket.IO      |          |                  |
++-----------------+          +------------------+          +------------------+
+                                     |
+                                     v
+                           +------------------+
+                           |  Redis Cache     |
+                           +------------------+
 ```
 
 ### Flow
 
-1. **Request**: dApp SDK creates a proof request via `POST /api/v1/proof/request` or Socket.IO `proof:request` event
-2. **Session**: Relay generates unique `requestId` and stores metadata (clientId, tier, callbackUrl)
-3. **Deep Link**: Relay generates a base64-encoded deep link (`zkproofport://proof-request?data=...`) for mobile app invocation
-4. **Status**: Mobile app performs proof generation, posting intermediate and final status updates via `POST /api/v1/proof/callback`
-5. **Delivery**: Relay broadcasts to connected clients via Socket.IO and retries webhook callbacks
-6. **Polling**: Clients can poll `GET /api/v1/proof/:requestId` until completion
+1. **Challenge**: SDK requests a challenge via `GET /api/v1/challenge`
+2. **Sign**: SDK signs the challenge with the user's wallet (EIP-191 personal_sign)
+3. **Request**: SDK creates a proof request via `POST /api/v1/proof/request` or Socket.IO `proof:request` event, including `challenge` + `signature`
+4. **Verify**: Relay recovers signer address via `ecrecover`, uses it as `clientId`
+5. **Session**: Relay generates unique `requestId`, computes inputs hash, stores metadata
+6. **Deep Link**: Relay generates a base64-encoded deep link (`zkproofport://proof-request?data=...`) for mobile app invocation
+7. **Status**: Mobile app performs proof generation, posting intermediate and final status updates via `POST /api/v1/proof/callback`
+8. **Delivery**: Relay broadcasts to connected clients via Socket.IO
+9. **Polling**: Clients can poll `GET /api/v1/proof/:requestId` until completion (includes `inputsHash`)
 
 ## Quick Start
 
@@ -79,32 +81,44 @@ Environment variables (see `.env.example`):
 | `PORT` | `4001` | Server port |
 | `CORS_ORIGIN` | `*` | CORS allowed origins |
 | `REDIS_URL` | (required) | Redis connection string |
-| `API_URL` | (required) | Backend API URL (e.g., `http://api:4000`) |
-| `INTERNAL_API_KEY` | (required) | Internal API key for backend authentication |
-| `JWT_SECRET` | (required) | JWT secret for token verification |
 | `RELAY_EXTERNAL_URL` | (required for production) | External relay URL for deep link callbacks |
-| `RELAY_PRIVATE_KEY` | (required) | Ethereum private key for on-chain nullifier registration |
-| `NULLIFIER_REGISTRY_ADDRESS` | (required) | NullifierRegistry contract address |
-| `CHAIN_RPC_URL` | (required) | Base Sepolia RPC endpoint |
 | `NODE_ENV` | `development` | Environment mode |
 
 ## API Reference
 
 ### Authentication
 
-**JWT Token Authentication is REQUIRED.** All requests must include `Authorization: Bearer <token>` header with a valid JWT token from the API server. The token payload must contain `{ sub: clientId, type: 'client', dappId, customerId, tier }`. The `clientId` is extracted from the token's `sub` field.
+**Challenge-Signature Authentication (EIP-191)** replaces JWT. The flow:
 
-**Important:** The `clientId` field in the request body (REST) or connection auth (Socket.IO) is ignored. Client identity is always determined from the JWT token.
+1. SDK calls `GET /api/v1/challenge` to obtain a random 32-byte hex challenge
+2. SDK signs the challenge with the user's wallet via `personal_sign` (EIP-191)
+3. SDK includes `challenge` and `signature` in the proof request body
+4. Relay recovers the signer address via `ethers.verifyMessage()` and uses it as the client identity
+5. Each challenge is single-use and expires after 2 minutes
 
 ### REST Endpoints
+
+#### GET /api/v1/challenge
+Request a random challenge for wallet signature authentication.
+
+**Rate limit:** 30 requests per minute per IP.
+
+**Response (200):**
+```json
+{
+  "challenge": "0xa1b2c3d4e5f6...",
+  "expiresAt": 1709654400000
+}
+```
 
 #### POST /api/v1/proof/request
 Create a new proof request session.
 
-**Request (with JWT token):**
+**Rate limit:** 10 requests per minute per IP.
+
+**Request:**
 ```bash
 curl -X POST http://relay:4001/api/v1/proof/request \
-  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
   -H "Content-Type: application/json" \
   -d '{
     "circuitId": "coinbase_attestation",
@@ -114,12 +128,11 @@ curl -X POST http://relay:4001/api/v1/proof/request \
       "signalHash": "0x5678...",
       "attesterRoot": "0x9abc..."
     },
-    "callbackUrl": "https://myapp.com/webhook/proof",
-    "nonce": "unique_idempotency_key"
+    "nonce": "unique_idempotency_key",
+    "challenge": "0xa1b2c3d4e5f6...",
+    "signature": "0xdeadbeef..."
   }'
 ```
-
-**Note:** The `clientId` field in the request body is optional and ignored. Client identity is always extracted from the JWT token's `sub` field.
 
 **Response (201):**
 ```json
@@ -134,17 +147,10 @@ curl -X POST http://relay:4001/api/v1/proof/request \
 **Status Codes:**
 - `201`: Request created successfully
 - `400`: Missing required fields or invalid inputs
-- `401`: Invalid or expired JWT token
-- `402`: Insufficient credits (credit tier)
-- `403`: Invalid or unknown clientId
+- `401`: Missing or invalid challenge/signature
 - `409`: Duplicate nonce (replay detected)
+- `429`: Rate limit exceeded
 - `500`: Internal server error
-
-**Notes:**
-- Free tier clients must provide `callbackUrl`
-- Credit tier clients checked for available credits
-- Nonce prevents duplicate requests (optional but recommended)
-- Default scope is `proofport:default:noop` for free tier
 
 #### GET /api/v1/proof/:requestId
 Poll proof request status.
@@ -155,6 +161,7 @@ Poll proof request status.
   "requestId": "550e8400-e29b-41d4-a716-446655440000",
   "status": "pending",
   "deepLink": "zkproofport://proof-request?data=eyJy...",
+  "inputsHash": "a1b2c3d4e5f6789...",
   "createdAt": "2025-02-01T10:00:00.000Z",
   "updatedAt": "2025-02-01T10:00:00.000Z"
 }
@@ -167,6 +174,7 @@ After completion:
   "status": "completed",
   "proof": "0x1234...",
   "publicInputs": ["0x5678...", "0x9abc..."],
+  "inputsHash": "a1b2c3d4e5f6789...",
   "deepLink": "zkproofport://proof-request?data=eyJy...",
   "createdAt": "2025-02-01T10:00:00.000Z",
   "updatedAt": "2025-02-01T10:00:10.000Z"
@@ -177,10 +185,6 @@ After completion:
 - `200`: Status retrieved
 - `404`: Request not found or expired (TTL: 10 minutes)
 - `500`: Internal server error
-
-**Polling Intervals:**
-- Free tier: 2-3 seconds (backend rate limit)
-- Credit/Plan1/Plan2: 1-2 seconds
 
 #### POST /api/v1/proof/callback
 Receive proof completion callback from mobile app.
@@ -222,11 +226,12 @@ Receive proof completion callback from mobile app.
 **Status Codes:**
 - `200`: Callback received
 - `400`: Missing requestId or status
+- `404`: Unknown or expired requestId
 - `500`: Internal server error
 
 **Behavior:**
 - Intermediate statuses (`generating`, `verifying`) update status only
-- Final statuses (`completed`, `failed`) trigger credit deduction, webhook delivery, and Socket.IO broadcast
+- Final statuses (`completed`, `failed`) store result and broadcast via Socket.IO
 - Result buffered in Redis for 5 minutes (client reconnection tolerance)
 
 #### GET /health
@@ -243,25 +248,18 @@ Health check endpoint.
 
 ### WebSocket Events (Socket.IO /proof namespace)
 
-**Connection (with JWT token):**
+**Connection (open, no auth middleware):**
 ```javascript
 const socket = io('http://relay:4001', {
   path: '/socket.io',
-  namespace: '/proof',
-  auth: {
-    token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...'
-  }
+  namespace: '/proof'
 });
 ```
 
-**Authentication:**
-- Clients MUST provide `token` (JWT) in connection auth
-- JWT token is verified; `clientId` is extracted from token's `sub` field
-- Free tier clients cannot use Socket.IO (REST only)
-- Invalid or missing token rejects connection
+Socket.IO connections are open. Authentication happens per-request via challenge+signature in the `proof:request` event data.
 
 #### Event: proof:request
-Client initiates proof request.
+Client initiates proof request (requires challenge+signature).
 
 **Send:**
 ```javascript
@@ -269,34 +267,25 @@ socket.emit('proof:request', {
   circuitId: 'coinbase_attestation',
   scope: 'proofport:kyc',
   inputs: { account: '0x...', signalHash: '0x...' },
-  callbackUrl: 'https://myapp.com/webhook/proof',
-  nonce: 'unique_idempotency_key'
+  nonce: 'unique_idempotency_key',
+  challenge: '0xa1b2c3d4e5f6...',
+  signature: '0xdeadbeef...'
 });
 ```
 
 **Receive (success):**
 ```javascript
 socket.on('proof:status', (data) => {
-  console.log(data);
-  // {
-  //   requestId: '550e8400-...',
-  //   status: 'pending',
-  //   deepLink: 'zkproofport://...'
-  // }
+  // { requestId: '550e8400-...', status: 'pending', deepLink: 'zkproofport://...' }
 });
 ```
 
 **Receive (error):**
 ```javascript
 socket.on('proof:error', (data) => {
-  console.error(data);
-  // { error: 'Insufficient credits', code: 402 }
+  // { error: 'Invalid or expired challenge', code: 401 }
 });
 ```
-
-**Notes:**
-- Client automatically joins room `request:{requestId}` after creation
-- Room used for all subsequent status updates
 
 #### Event: proof:subscribe
 Subscribe to existing proof request (for reconnection).
@@ -311,74 +300,40 @@ socket.emit('proof:subscribe', {
 **Receive (if completed, buffered result):**
 ```javascript
 socket.on('proof:result', (result) => {
-  console.log(result);
-  // {
-  //   requestId: '550e8400-...',
-  //   status: 'completed',
-  //   proof: '0x1234...',
-  //   publicInputs: ['0x5678...'],
-  //   completedAt: '2025-02-01T10:00:10.000Z'
-  // }
+  // { requestId, status: 'completed', proof, publicInputs, completedAt }
 });
 ```
 
 **Receive (if still pending):**
 ```javascript
 socket.on('proof:status', (data) => {
-  console.log(data);
-  // { requestId: '550e8400-...', status: 'generating', deepLink: '...' }
+  // { requestId, status: 'generating', deepLink }
 });
 ```
 
 **Receive (if expired):**
 ```javascript
 socket.on('proof:error', (data) => {
-  console.error(data);
-  // { error: 'Request not found or expired', requestId: '550e8400-...' }
+  // { error: 'Request not found or expired', requestId }
 });
 ```
 
 #### Event: proof:status (Server -> Client)
 Real-time status update for active request.
 
-**Broadcast (intermediate):**
-```javascript
-socket.on('proof:status', (data) => {
-  // { requestId: '550e8400-...', status: 'verifying' }
-});
-```
+#### Event: proof:result (Server -> Client)
+Final proof result broadcast.
 
-**Broadcast (completion):**
-```javascript
-socket.on('proof:result', (result) => {
-  // {
-  //   requestId: '550e8400-...',
-  //   status: 'completed',
-  //   proof: '0x1234...',
-  //   publicInputs: [...],
-  //   completedAt: '2025-02-01T10:00:10.000Z'
-  // }
-});
-```
+## Rate Limiting
 
-## Tier System
+IP-based in-memory sliding window rate limiting:
 
-| Tier | Rate Limit | Session TTL | Credit Deduction | Scope Control | On-Chain Registration | Callback |
-|------|-----------|-------------|------------------|---------------|----------------------|----------|
-| `free` | Backend enforced | 10 min | 1 per request | Forced `proofport:default:noop` | No | Required |
-| `credit` | 100 req/min | 10 min | 1 per completion | User-provided | No | Optional |
-| `plan1` | Plan-based | 10 min | Plan-based | User-provided | No | Optional |
-| `plan2` | Plan-based | 10 min | Plan-based | User-provided | Yes (nullifier on-chain) | Optional |
+| Endpoint | Limit | Window |
+|----------|-------|--------|
+| `GET /api/v1/challenge` | 30 requests | 1 minute per IP |
+| `POST /api/v1/proof/request` | 10 requests | 1 minute per IP |
 
-**Tier Behavior:**
-
-- **Free**: Must provide `callbackUrl` (Socket.IO denied). Cannot use custom scope. 1 credit deducted per request.
-- **Credit**: Can use Socket.IO and REST. Uses custom scope. 1 credit deducted on successful proof completion.
-- **Plan1**: Can use Socket.IO and REST. Uses custom scope. Credits based on plan.
-- **Plan2**: Same as Plan1 plus on-chain nullifier registration via `RELAY_PRIVATE_KEY`.
-
-**Client Plan Validation:**
-Relay calls backend `GET /internal/plan/{clientId}` to validate tier and check credit balance.
+Exceeding limits returns HTTP 429.
 
 ## Storage
 
@@ -390,60 +345,27 @@ All session data cached in Redis with TTL:
 |-------------|-----|---------|
 | `proof:status:{requestId}` | 10 min | Current proof status |
 | `proof:result:{requestId}` | 5 min | Proof result (for reconnection) |
-| `proof:callback:{requestId}` | 10 min | Callback URL |
-| `proof:tier:{requestId}` | 10 min | Client tier (for credit deduction) |
-| `proof:client:{requestId}` | 10 min | ClientId (for credit deduction) |
 | `proof:nonce:{nonce}` | 10 min | Nonce seen flag (replay prevention) |
-
-### In-Memory Fallback
-
-If Redis unavailable:
-- Uses JavaScript `Map` for session data
-- Automatic expiration via TTL tracking
-- Full feature parity with Redis
-- No data persistence (resets on restart)
-
-## Webhook Callback Delivery
-
-Relay sends proof results to registered `callbackUrl` with automatic retries.
-
-**Payload:**
-```json
-{
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "completed",
-  "proof": "0x1234...",
-  "publicInputs": ["0x5678...", "0x9abc..."],
-  "error": null
-}
-```
-
-**Retry Strategy:**
-- Maximum 3 attempts
-- Exponential backoff: 1s, 2s, 4s (500ms base)
-- 10-second timeout per request
-- Fire-and-forget (no error on final failure)
-
-**Errors:**
-Failed callback attempts logged but don't block proof completion. Client can always poll `GET /api/v1/proof/:requestId`.
+| `proof:inputsHash:{requestId}` | 10 min | SHA256 hash of proof inputs |
+| `challenge:{challenge}` | 2 min | Challenge for signature auth |
 
 ## Deep Link Format
 
 Deep links encode the entire proof request as base64-encoded JSON:
 
 ```
-zkproofport://proof-request?data=eyJyZXF1ZXN0SWQiOiI1NTBlODQwMC1lMjliLTQxZDQtYTcxNi00NDY2NTU0NDAwMDAiLCJjbGllbnRJZCI6ImNsaWVudF8xMjMiLCJjaXJjdWl0SWQiOiJjb2luYmFzZV9hdHRlc3RhdGlvbiIsInNjb3BlIjoicHJvb2Zwb3J0Omtv...
+zkproofport://proof-request?data=eyJyZXF1ZXN0SWQiOiI1NTBlODQwMC1lMjliLTQxZDQtYTcxNi00NDY2NTU0NDAwMDAi...
 ```
 
 **Decoded:**
 ```json
 {
   "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "clientId": "client_123",
+  "clientId": "0x1234567890abcdef...",
   "circuitId": "coinbase_attestation",
   "scope": "proofport:kyc",
   "inputs": { "account": "0x...", "signalHash": "0x..." },
-  "callbackUrl": "https://myapp.com/webhook/proof",
+  "callbackUrl": "http://relay:4001/api/v1/proof/callback",
   "createdAt": "2025-02-01T10:00:00.000Z"
 }
 ```
@@ -454,30 +376,19 @@ Mobile app decodes and extracts fields for proof generation.
 
 ### Backend (dApp SDK)
 
-**REST Example with JWT Token (Recommended):**
+**REST Example with Challenge-Signature Auth:**
 ```javascript
-// First, obtain JWT token from API server
-const authResponse = await fetch('http://api:4000/api/auth/token', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'x-api-key': 'your_api_key'
-  },
-  body: JSON.stringify({
-    dappId: 'your_dapp_id',
-    customerId: 'your_customer_id'
-  })
-});
+// Step 1: Get challenge
+const challengeRes = await fetch('http://relay:4001/api/v1/challenge');
+const { challenge, expiresAt } = await challengeRes.json();
 
-const { token } = await authResponse.json();
+// Step 2: Sign challenge with wallet (EIP-191)
+const signature = await wallet.signMessage(challenge);
 
-// Use token for relay requests
+// Step 3: Create proof request
 const response = await fetch('http://relay:4001/api/v1/proof/request', {
   method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${token}`
-  },
+  headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
     circuitId: 'coinbase_attestation',
     scope: 'proofport:kyc',
@@ -486,50 +397,46 @@ const response = await fetch('http://relay:4001/api/v1/proof/request', {
       signalHash: challengeHash,
       attesterRoot: merkleRoot
     },
-    callbackUrl: 'https://myapp.com/webhook/proof',
-    nonce: UUID() // Prevent duplicate submissions
+    nonce: UUID(),
+    challenge,
+    signature
   })
 });
 
 const { requestId, deepLink, status, pollUrl } = await response.json();
 
-// Store requestId in session
-// Display QR code with deepLink
-// Poll pollUrl every 2 seconds
+// Step 4: Poll for result (includes inputsHash for integrity check)
+const pollRes = await fetch(`http://relay:4001${pollUrl}`);
+const result = await pollRes.json();
+console.log('Inputs hash:', result.inputsHash);
 ```
 
-
-**Socket.IO Example with JWT Token (Recommended):**
+**Socket.IO Example:**
 ```javascript
-// First, obtain JWT token from API server (same as REST example above)
-const { token } = await authResponse.json();
+const socket = io('http://relay:4001', { namespace: '/proof' });
 
-const socket = io('http://relay:4001', {
-  namespace: '/proof',
-  auth: { token }
-});
+// Get challenge first
+const { challenge } = await (await fetch('http://relay:4001/api/v1/challenge')).json();
+const signature = await wallet.signMessage(challenge);
 
 socket.on('connect', () => {
   socket.emit('proof:request', {
     circuitId: 'coinbase_attestation',
     scope: 'proofport:kyc',
     inputs: { account: userAddress, signalHash: challengeHash },
-    nonce: UUID()
+    nonce: UUID(),
+    challenge,
+    signature
   });
 });
 
 socket.on('proof:status', (data) => {
-  if (data.status === 'pending') {
-    console.log(`Proof generation started. Deep link: ${data.deepLink}`);
-  } else if (data.status === 'generating') {
-    console.log('Proof generation in progress...');
-  }
+  console.log(`Status: ${data.status}, Deep link: ${data.deepLink}`);
 });
 
 socket.on('proof:result', (result) => {
   if (result.status === 'completed') {
     console.log(`Proof received: ${result.proof}`);
-    // Submit proof to smart contract
   } else {
     console.error(`Proof failed: ${result.error}`);
   }
@@ -539,7 +446,6 @@ socket.on('proof:error', (err) => {
   console.error(`Error: ${err.error} (code: ${err.code})`);
 });
 ```
-
 
 ### Mobile App (Proof Generation)
 
@@ -562,26 +468,6 @@ await fetch('http://relay:4001/api/v1/proof/callback', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify(result)
-});
-```
-
-### Webhook Consumer (dApp Backend)
-
-Receives callbacks at registered `callbackUrl`:
-
-```javascript
-app.post('/webhook/proof', (req, res) => {
-  const { requestId, status, proof, publicInputs, error } = req.body;
-
-  if (status === 'completed') {
-    // Verify proof on-chain or use for downstream logic
-    submitProofToContract(proof, publicInputs);
-  } else {
-    // Handle failure
-    logProofError(requestId, error);
-  }
-
-  res.json({ received: true });
 });
 ```
 
@@ -608,8 +494,8 @@ Development logs to stdout. Production should use structured logging (JSON).
 - `[REST]` - HTTP endpoint errors
 - `[Socket.IO]` - WebSocket events
 - `[Redis]` - Redis connection state
-- `[Callback]` - Webhook delivery
-- `[Backend]` - Backend API calls
+- `[Relay Callback]` - Callback processing
+- `[Relay Poll]` - Status polling
 
 ## Docker
 
@@ -622,8 +508,6 @@ docker build -t proofport-relay .
 ```bash
 docker run -p 4001:4001 \
   -e REDIS_URL=redis://redis:6379 \
-  -e API_URL=http://api:4000 \
-  -e INTERNAL_API_KEY=secret \
   proofport-relay
 ```
 
@@ -636,8 +520,6 @@ services:
       - '4001:4001'
     environment:
       REDIS_URL: redis://redis:6379
-      API_URL: http://api:4000
-      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
     depends_on:
       - redis
 
@@ -652,14 +534,9 @@ services:
 Key types exported from `src/types.ts`:
 
 ```typescript
-type Tier = 'free' | 'credit' | 'plan1' | 'plan2';
-
-interface PlanInfo {
-  clientId: string;
-  tier: Tier;
-  credits?: number;
-  scope?: string;
-  callbackUrl?: string;
+interface ChallengeResponse {
+  challenge: string;  // hex-encoded 32 random bytes
+  expiresAt: number;  // unix timestamp ms
 }
 
 interface ProofRequest {
@@ -668,24 +545,26 @@ interface ProofRequest {
   circuitId: string;
   scope: string;
   inputs: Record<string, unknown>;
+  inputsHash?: string;
   callbackUrl?: string;
   createdAt: string;
 }
 
 interface ProofStatus {
   requestId: string;
-  status: 'pending' | 'generating' | 'completed' | 'failed' | 'expired';
+  status: 'pending' | 'generating' | 'completed' | 'failed' | 'error' | 'expired';
   proof?: string;
   publicInputs?: string[];
   error?: string;
   deepLink?: string;
+  inputsHash?: string;
   createdAt: string;
   updatedAt: string;
 }
 
 interface ProofResult {
   requestId: string;
-  status: 'completed' | 'failed';
+  status: 'completed' | 'failed' | 'error';
   proof?: string;
   publicInputs?: string[];
   error?: string;
@@ -699,29 +578,25 @@ interface ProofResult {
 
 | Scenario | HTTP Status | Error Message |
 |----------|-------------|---------------|
-| Missing JWT token | 401 | `Authorization header required` |
-| Invalid JWT token | 401 | `Invalid or expired JWT token` |
+| Missing challenge/signature | 401 | `challenge and signature are required` |
+| Invalid/expired challenge | 401 | `Invalid or expired challenge` |
+| Invalid signature | 401 | `Invalid signature` |
 | Missing circuitId | 400 | `circuitId is required` |
 | Missing inputs | 400 | `inputs object is required` |
-| Invalid clientId | 403 | `Invalid or unknown clientId` |
-| Insufficient credits | 402 | `Insufficient credits` |
-| Free tier without callback | 400 | `callbackUrl is required for free tier` |
 | Replay detected | 409 | `Duplicate nonce (replay detected)` |
 | Request expired | 404 | `Request not found or expired` |
-| Free tier on Socket.IO | Error | `Free tier must use REST API with callbackUrl` |
-| Missing Socket.IO token | Error | `Authentication error: JWT token required` |
+| Rate limit exceeded | 429 | `Too many requests. Please try again later.` |
 
 ## Performance
 
 **Throughput:**
 - REST: 100+ requests/second per instance (Redis-backed)
 - Socket.IO: 500+ concurrent connections per instance
-- Callback delivery: 50+ concurrent webhooks
 
 **Latency:**
+- Challenge generation: <10ms
 - Request creation: <50ms (Redis)
 - Status polling: <20ms (cached)
-- Callback delivery: <100ms (with retries)
 
 **Resource Usage (per instance):**
 - CPU: 1-2 cores typical, 4 cores recommended
@@ -733,9 +608,9 @@ interface ProofResult {
 **File Structure:**
 ```
 src/
-├── index.ts      # Express server, REST endpoints, Socket.IO handlers
-├── types.ts      # TypeScript interfaces
-└── redis.ts      # Redis wrapper with in-memory fallback
++-- index.ts      # Express server, REST endpoints, Socket.IO handlers
++-- types.ts      # TypeScript interfaces
++-- redis.ts      # Redis wrapper
 ```
 
 **Scripts:**
@@ -743,12 +618,6 @@ src/
 - `npm run build` - Compile TypeScript
 - `npm start` - Production server
 - `npx tsc --noEmit` - Type checking
-
-**Linting & Formatting:**
-Not included. Add ESLint/Prettier as needed:
-```bash
-npm install --save-dev eslint prettier typescript-eslint
-```
 
 ## License
 

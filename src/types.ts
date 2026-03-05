@@ -1,13 +1,6 @@
-export type Tier = 'free' | 'credit' | 'plan1' | 'plan2';
-
-export interface PlanInfo {
-  clientId: string;
-  tier: Tier;
-  credits?: number;
-  freeCredits?: number;
-  paidCredits?: number;
-  scope?: string;
-  callbackUrl?: string;
+export interface ChallengeResponse {
+  challenge: string;  // hex-encoded 32 random bytes
+  expiresAt: number;  // unix timestamp ms
 }
 
 export interface ProofRequest {
@@ -16,6 +9,7 @@ export interface ProofRequest {
   circuitId: string;
   scope: string;
   inputs: Record<string, unknown>;
+  inputsHash?: string;
   callbackUrl?: string;
   createdAt: string;
 }
@@ -44,8 +38,7 @@ export interface ProofStatus {
   nullifier?: string;
   circuit?: string;
   deepLink?: string;
-  onChainStatus?: string;
-  txHash?: string;
+  inputsHash?: string;
   createdAt: string;
   updatedAt: string;
 }

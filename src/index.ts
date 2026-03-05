@@ -5,9 +5,9 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
-import jwt from 'jsonwebtoken';
-import { initRedis, cacheSet, cacheGet, cacheSetNX } from './redis';
-import type { PlanInfo, ProofRequest, ProofResult, ProofStatus, Tier } from './types';
+import { createHash } from 'crypto';
+import { initRedis, cacheSet, cacheGet, cacheDel } from './redis';
+import type { ProofRequest, ProofResult, ProofStatus } from './types';
 import { ethers } from 'ethers';
 
 dotenv.config();
@@ -23,43 +23,16 @@ if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.CORS_ORI
 const CORS_ORIGIN: string | string[] = process.env.CORS_ORIGIN
   ? (process.env.CORS_ORIGIN === '*' ? '*' : process.env.CORS_ORIGIN.split(',').map(s => s.trim()))
   : '*';
-if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.API_URL) {
-  throw new Error('API_URL environment variable is required in production/staging');
-}
-const BACKEND_URL = process.env.API_URL || 'http://localhost:4000';
-if (!process.env.INTERNAL_API_KEY) throw new Error('INTERNAL_API_KEY environment variable is required');
-const INTERNAL_KEY: string = process.env.INTERNAL_API_KEY;
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
 
-const FREE_SCOPE = 'proofport:default:noop';
 const RESULT_TTL = 300; // 5 minutes
 const STATUS_TTL = 600; // 10 minutes
 const NONCE_TTL = 600;  // 10 minutes (replay prevention)
+const CHALLENGE_TTL = 120; // 2 minutes
+
 if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.RELAY_EXTERNAL_URL) {
   throw new Error('RELAY_EXTERNAL_URL environment variable is required in production/staging');
 }
 const RELAY_EXTERNAL_URL = process.env.RELAY_EXTERNAL_URL || '';
-
-// On-chain nullifier registration (Plan 2)
-const RELAY_PRIVATE_KEY = process.env.RELAY_PRIVATE_KEY || '';
-const NULLIFIER_REGISTRY_ADDRESS = process.env.NULLIFIER_REGISTRY_ADDRESS || '';
-const CHAIN_RPC_URL = process.env.CHAIN_RPC_URL;
-if (!CHAIN_RPC_URL) throw new Error('CHAIN_RPC_URL environment variable is required');
-
-const NULLIFIER_REGISTRY_ABI = [
-  'function verifyAndRegister(bytes32 _circuitId, bytes calldata _proof, bytes32[] calldata _publicInputs) external returns (uint8 status, bytes32 nullifier, bytes32 scope)',
-  'function isNullifierRegistered(bytes32 _nullifier) external view returns (bool)',
-  'function getNullifierInfo(bytes32 _nullifier) external view returns (uint64 registeredAt, bytes32 scope, bytes32 circuitId)',
-];
-
-const VERIFY_STATUS_NAMES: Record<number, string> = {
-  0: 'verified_and_registered',
-  1: 'already_registered',
-  2: 'expired_and_reregistered',
-  3: 'verification_failed',
-  4: 'circuit_not_found',
-};
 
 // ---------------------------------------------------------------------------
 // Express + HTTP
@@ -82,81 +55,84 @@ const io = new Server(httpServer, {
 const proofNs = io.of('/proof');
 
 // ---------------------------------------------------------------------------
-// JWT verification
+// Rate limiting (in-memory sliding window)
 // ---------------------------------------------------------------------------
-interface ClientJwtPayload {
-  sub: string;      // clientId
-  type: 'client';
-  dappId: string;
-  customerId: string;
-  tier: string;
+const RATE_LIMITS = {
+  challenge: { windowMs: 60_000, max: 30 },   // 30 challenges per minute per IP
+  request: { windowMs: 60_000, max: 10 },      // 10 proof requests per minute per IP
+};
+
+const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+
+function rateLimit(type: keyof typeof RATE_LIMITS) {
+  return (req: Request, res: Response, next: Function) => {
+    const ip = req.ip || 'unknown';
+    const key = `${type}:${ip}`;
+    const limit = RATE_LIMITS[type];
+    const now = Date.now();
+
+    const entry = rateLimitStore.get(key);
+    if (!entry || now > entry.resetAt) {
+      rateLimitStore.set(key, { count: 1, resetAt: now + limit.windowMs });
+      return next();
+    }
+
+    if (entry.count >= limit.max) {
+      res.status(429).json({ error: 'Too many requests. Please try again later.' });
+      return;
+    }
+
+    entry.count++;
+    next();
+  };
 }
 
-function verifyClientToken(token: string): ClientJwtPayload | null {
+// Periodic cleanup (every 5 minutes)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitStore) {
+    if (now > entry.resetAt) rateLimitStore.delete(key);
+  }
+}, 300_000);
+
+// ---------------------------------------------------------------------------
+// Challenge-signature auth
+// ---------------------------------------------------------------------------
+function challengeKey(challenge: string) { return `challenge:${challenge}`; }
+
+async function verifyChallenge(challenge: string, signature: string): Promise<{ valid: boolean; signerAddress?: string; error?: string }> {
+  if (!challenge || !signature) {
+    return { valid: false, error: 'challenge and signature are required' };
+  }
+
+  // Check challenge exists in Redis (prevents replay)
+  const stored = await cacheGet(challengeKey(challenge));
+  if (!stored) {
+    return { valid: false, error: 'Invalid or expired challenge' };
+  }
+
   try {
-    const decoded = jwt.verify(token, JWT_SECRET as string) as unknown as ClientJwtPayload;
-    if (decoded.type !== 'client') return null;
-    return decoded;
-  } catch (err) {
-    return null;
+    // Recover signer address from EIP-191 personal_sign
+    const signerAddress = ethers.verifyMessage(challenge, signature);
+
+    // Delete challenge from Redis (one-time use)
+    await cacheDel(challengeKey(challenge));
+
+    return { valid: true, signerAddress };
+  } catch (err: any) {
+    return { valid: false, error: 'Invalid signature' };
   }
 }
 
-function extractBearerToken(req: Request): string | null {
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) return null;
-  return auth.slice(7);
-}
-
 // ---------------------------------------------------------------------------
-// Backend API client
+// Inputs hash
 // ---------------------------------------------------------------------------
-async function getPlan(clientId: string): Promise<PlanInfo> {
-  const res = await fetch(`${BACKEND_URL}/internal/plan/${clientId}`, {
-    headers: { 'x-internal-key': INTERNAL_KEY },
-  });
-  if (!res.ok) throw new Error(`Plan lookup failed (${res.status})`);
-  return res.json() as Promise<PlanInfo>;
+function computeInputsHash(inputs: Record<string, unknown>): string {
+  const canonical = JSON.stringify(inputs, Object.keys(inputs).sort());
+  return createHash('sha256').update(canonical).digest('hex');
 }
 
-async function deductCredit(clientId: string, creditType: 'free' | 'paid' | 'auto' = 'auto', referenceId?: string): Promise<boolean> {
-  try {
-    const res = await fetch(`${BACKEND_URL}/internal/credits/deduct`, {
-      method: 'POST',
-      headers: {
-        'x-internal-key': INTERNAL_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ clientId, amount: 1, creditType, referenceId }),
-    });
-    return res.ok;
-  } catch (err) {
-    console.error('[Backend] Credit deduction failed:', err);
-    return false;
-  }
-}
-
-async function logUsage(
-  clientId: string,
-  circuit: string,
-  requestId: string,
-  creditType?: string,
-  status = 'success',
-  onChainData?: { nullifier?: string; txHash?: string; onChainStatus?: string }
-): Promise<void> {
-  try {
-    await fetch(`${BACKEND_URL}/internal/usage`, {
-      method: 'POST',
-      headers: {
-        'x-internal-key': INTERNAL_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ clientId, circuit, requestId, creditsUsed: 1, status, creditType, ...onChainData }),
-    });
-  } catch (err) {
-    console.error('[Backend] Usage logging failed:', err);
-  }
-}
+function inputsHashKey(requestId: string) { return `proof:inputsHash:${requestId}`; }
 
 // ---------------------------------------------------------------------------
 // Deep link generation
@@ -177,15 +153,6 @@ function resultKey(requestId: string) {
 }
 function nonceKey(nonce: string) {
   return `proof:nonce:${nonce}`;
-}
-function tierKey(requestId: string) {
-  return `proof:tier:${requestId}`;
-}
-function clientKey(requestId: string) {
-  return `proof:client:${requestId}`;
-}
-function circuitKey(requestId: string) {
-  return `proof:circuit:${requestId}`;
 }
 
 async function setStatus(requestId: string, status: Partial<ProofStatus>): Promise<void> {
@@ -209,164 +176,39 @@ async function getStatus(requestId: string): Promise<ProofStatus | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Nullifier extraction from public inputs (mirrors SDK verifier.ts)
-// ---------------------------------------------------------------------------
-function extractBytes32FromFields(publicInputs: string[], startIndex: number): string {
-  if (publicInputs.length <= startIndex + 31) return '0x' + '00'.repeat(32);
-  const fields = publicInputs.slice(startIndex, startIndex + 32);
-  const bytes = fields.map(f => {
-    const byte = BigInt(f) & 0xFFn;
-    return byte.toString(16).padStart(2, '0');
-  }).join('');
-  return '0x' + bytes;
-}
-
-function extractNullifierFromPublicInputs(publicInputs: string[], circuit?: string): string {
-  const start = circuit === 'coinbase_country_attestation' ? 118 : 96;
-  return extractBytes32FromFields(publicInputs, start);
-}
-
-function extractScopeFromPublicInputs(publicInputs: string[], circuit?: string): string {
-  const start = circuit === 'coinbase_country_attestation' ? 86 : 64;
-  return extractBytes32FromFields(publicInputs, start);
-}
-
-// ---------------------------------------------------------------------------
-// On-chain nullifier registration (Plan 2)
-// ---------------------------------------------------------------------------
-async function registerNullifierOnChain(
-  circuitId: string,
-  proof: string,
-  publicInputs: string[]
-): Promise<{
-  status: string;
-  nullifier: string;
-  scope: string;
-  txHash?: string;
-  error?: string;
-}> {
-  if (!RELAY_PRIVATE_KEY || !NULLIFIER_REGISTRY_ADDRESS) {
-    return { status: 'failed', nullifier: '', scope: '', error: 'Relay signer or registry not configured' };
-  }
-
-  try {
-    const provider = new ethers.JsonRpcProvider(CHAIN_RPC_URL);
-    const signer = new ethers.Wallet(RELAY_PRIVATE_KEY, provider);
-    const registry = new ethers.Contract(NULLIFIER_REGISTRY_ADDRESS, NULLIFIER_REGISTRY_ABI, signer);
-
-    // Convert circuitId string to bytes32
-    const circuitIdBytes = ethers.encodeBytes32String(circuitId.length <= 31 ? circuitId : '');
-    // If circuitId is already hex, use it directly
-    const circuitIdHex = circuitId.startsWith('0x') ? circuitId : circuitIdBytes;
-
-    // Ensure proof has 0x prefix
-    const proofHex = proof.startsWith('0x') ? proof : '0x' + proof;
-
-    // Ensure public inputs are bytes32
-    const publicInputsHex = publicInputs.map(input => {
-      const hex = input.startsWith('0x') ? input : '0x' + input;
-      return ethers.zeroPadValue(hex, 32);
-    });
-
-    // First, use staticCall to get return values without sending transaction
-    const [statusCode, nullifierBytes, scopeBytes] = await registry.verifyAndRegister.staticCall(
-      circuitIdHex,
-      proofHex,
-      publicInputsHex
-    );
-    const statusNum = Number(statusCode);
-    const statusName = VERIFY_STATUS_NAMES[statusNum] || 'unknown';
-
-    // Convert bytes32 return values to hex strings
-    const nullifier = nullifierBytes as string;
-    const scope = scopeBytes as string;
-
-    // Check status and decide whether to send actual transaction
-    if (statusNum === 1) {
-      // ALREADY_REGISTERED - no transaction needed
-      return {
-        status: statusName,
-        nullifier,
-        scope,
-      };
-    } else if (statusNum === 3) {
-      // VERIFICATION_FAILED
-      return {
-        status: statusName,
-        nullifier,
-        scope,
-        error: 'Proof verification failed',
-      };
-    } else if (statusNum === 4) {
-      // CIRCUIT_NOT_FOUND
-      return {
-        status: statusName,
-        nullifier,
-        scope,
-        error: 'Circuit not found in registry',
-      };
-    } else if (statusNum === 0 || statusNum === 2) {
-      // VERIFIED_AND_REGISTERED or EXPIRED_AND_REREGISTERED - send actual transaction
-      // Noir proof verification is gas-intensive; set explicit high gas limit
-      const tx = await registry.verifyAndRegister(circuitIdHex, proofHex, publicInputsHex, { gasLimit: 10_000_000 });
-      const receipt = await tx.wait();
-
-      return {
-        status: statusName,
-        nullifier,
-        scope,
-        txHash: receipt.hash,
-      };
-    } else {
-      // Unknown status
-      return {
-        status: statusName,
-        nullifier,
-        scope,
-        error: `Unknown status code: ${statusNum}`,
-      };
-    }
-  } catch (err: any) {
-    console.error('[Relay] On-chain registration failed:', err.message);
-
-    // Try to extract nullifier/scope for error response
-    const nullifier = extractNullifierFromPublicInputs(publicInputs, circuitId);
-    const scope = extractScopeFromPublicInputs(publicInputs, circuitId);
-
-    return {
-      status: 'failed',
-      nullifier,
-      scope,
-      error: err.message,
-    };
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Core proof request processing
 // ---------------------------------------------------------------------------
 async function processProofRequest(body: {
-  clientId?: string;
   circuitId?: string;
   scope?: string;
   inputs?: Record<string, unknown>;
   nonce?: string;
+  challenge?: string;
+  signature?: string;
 }, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
-  const { clientId, circuitId, scope, inputs, nonce } = body;
+  const { circuitId, scope, inputs, nonce, challenge, signature } = body;
 
-  console.log(`[Relay] processProofRequest: clientId=${clientId}, circuitId=${circuitId}, scope=${scope || 'none'}, inputKeys=${inputs ? Object.keys(inputs).join(',') : 'none'}, nonce=${nonce || 'none'}`);
+  console.log(`[Relay] processProofRequest: circuitId=${circuitId}, scope=${scope || 'none'}, inputKeys=${inputs ? Object.keys(inputs).join(',') : 'none'}, nonce=${nonce || 'none'}`);
+
+  // Verify challenge-signature
+  if (!challenge || !signature) {
+    return { ok: false, error: 'challenge and signature are required', code: 401 };
+  }
+
+  const challengeResult = await verifyChallenge(challenge, signature);
+  if (!challengeResult.valid) {
+    console.log(`[Relay] Challenge verification failed: ${challengeResult.error}`);
+    return { ok: false, error: challengeResult.error!, code: 401 };
+  }
+
+  const signerAddress = challengeResult.signerAddress!;
+  console.log(`[Relay] Challenge verified, signer: ${signerAddress}`);
 
   // Validate required fields
-  if (!clientId || typeof clientId !== 'string') {
-    console.log('[Relay] Rejected: clientId is required');
-    return { ok: false, error: 'clientId is required', code: 400 };
-  }
   if (!circuitId || typeof circuitId !== 'string') {
-    console.log('[Relay] Rejected: circuitId is required');
     return { ok: false, error: 'circuitId is required', code: 400 };
   }
   if (!inputs || typeof inputs !== 'object') {
-    console.log('[Relay] Rejected: inputs object is required');
     return { ok: false, error: 'inputs object is required', code: 400 };
   }
 
@@ -374,54 +216,20 @@ async function processProofRequest(body: {
   if (nonce) {
     const seen = await cacheGet(nonceKey(nonce));
     if (seen) {
-      console.log(`[Relay] Rejected: duplicate nonce ${nonce}`);
       return { ok: false, error: 'Duplicate nonce (replay detected)', code: 409 };
     }
     await cacheSet(nonceKey(nonce), '1', NONCE_TTL);
   }
 
-  // Validate client and get plan
-  let plan: PlanInfo;
-  try {
-    plan = await getPlan(clientId);
-  } catch (err: any) {
-    console.error('[Relay] Plan lookup failed:', err.message);
-    return { ok: false, error: 'Invalid or unknown clientId', code: 403 };
-  }
-
-  const tier: Tier = plan.tier || 'free';
-
-  // Free tier: check credits and deduct immediately (success or failure)
-  if (tier === 'free') {
-    const totalCredits = (plan.freeCredits ?? 0) + (plan.paidCredits ?? 0);
-    if (totalCredits <= 0) {
-      console.log(`[Relay] Rejected: insufficient credits for ${clientId}`);
-      return { ok: false, error: 'Insufficient credits. Purchase more at the dashboard.', code: 402 };
-    }
-  }
-
-  // Credit tier: check balance (deduction happens on completion)
-  if (tier === 'credit') {
-    const totalCredits = (plan.freeCredits ?? 0) + (plan.paidCredits ?? 0);
-    if (totalCredits <= 0) {
-      console.log(`[Relay] Rejected: insufficient credits for ${clientId} (credit tier)`);
-      return { ok: false, error: 'Insufficient credits', code: 402 };
-    }
-  }
-
-
-  // Scope injection: free tier gets noop scope
-  const effectiveScope = tier === 'free' ? FREE_SCOPE : (scope || FREE_SCOPE);
-
   const requestId = uuidv4();
   const now = new Date().toISOString();
+  const effectiveScope = scope || '';
 
-  // Deep link callbackUrl always points to the relay so the app sends results here.
   const relayCallbackUrl = `${RELAY_EXTERNAL_URL || relayBaseUrl || `http://localhost:${PORT}`}/api/v1/proof/callback`;
 
   const proofRequest: ProofRequest = {
     requestId,
-    clientId,
+    clientId: signerAddress,
     circuitId,
     scope: effectiveScope,
     inputs,
@@ -429,10 +237,9 @@ async function processProofRequest(body: {
     createdAt: now,
   };
 
-  // Store metadata for credit deduction
-  await cacheSet(tierKey(requestId), tier, STATUS_TTL);
-  await cacheSet(clientKey(requestId), clientId, STATUS_TTL);
-  await cacheSet(circuitKey(requestId), circuitId, STATUS_TTL);
+  // Compute and store inputs hash for deep link integrity verification
+  const inputsHash = computeInputsHash(inputs);
+  await cacheSet(inputsHashKey(requestId), inputsHash, STATUS_TTL);
 
   // Set initial status
   const status: ProofStatus = {
@@ -444,49 +251,45 @@ async function processProofRequest(body: {
   };
   await cacheSet(statusKey(requestId), JSON.stringify(status), STATUS_TTL);
 
-  // Emit to Socket.IO room for any listeners
   proofNs.to(`request:${requestId}`).emit('proof:status', { requestId, status: 'pending' });
 
-  console.log(`[Relay] Proof request created: ${requestId} (tier=${tier}, circuit=${circuitId})`);
-  console.log(`[Relay] Deep link callbackUrl: ${relayCallbackUrl}`);
-  console.log(`[Relay] Deep link data keys: ${Object.keys(proofRequest).join(', ')}`);
-
-  // Free tier: deduct 1 credit immediately at request time
-  if (tier === 'free') {
-    const ok = await deductCredit(clientId, 'auto', requestId);
-    if (!ok) {
-      console.warn(`[Relay] Free tier credit deduction failed for ${clientId}, request ${requestId}`);
-    }
-    logUsage(clientId, circuitId, requestId, 'free', 'requested');
-  }
+  console.log(`[Relay] Proof request created: ${requestId} (signer=${signerAddress}, circuit=${circuitId})`);
 
   return { ok: true, requestId, deepLink: status.deepLink!, status };
 }
 
 // ---------------------------------------------------------------------------
+// REST: GET /api/v1/challenge
+// ---------------------------------------------------------------------------
+app.get('/api/v1/challenge', rateLimit('challenge'), async (req: Request, res: Response) => {
+  try {
+    // Generate random 32-byte challenge
+    const challengeBytes = ethers.randomBytes(32);
+    const challenge = ethers.hexlify(challengeBytes);
+
+    // Store in Redis with TTL
+    await cacheSet(challengeKey(challenge), JSON.stringify({
+      createdAt: Date.now(),
+      ip: req.ip,
+    }), CHALLENGE_TTL);
+
+    res.json({
+      challenge,
+      expiresAt: Date.now() + (CHALLENGE_TTL * 1000),
+    });
+  } catch (err: any) {
+    console.error('[REST] Challenge generation error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // REST: POST /api/v1/proof/request
 // ---------------------------------------------------------------------------
-app.post('/api/v1/proof/request', async (req: Request, res: Response) => {
+app.post('/api/v1/proof/request', rateLimit('request'), async (req: Request, res: Response) => {
   try {
-    const bearerToken = extractBearerToken(req);
-    if (!bearerToken) {
-      console.log('[REST] No Authorization header — JWT required');
-      res.status(401).json({ error: 'Authorization header with Bearer token is required' });
-      return;
-    }
-
-    const payload = verifyClientToken(bearerToken);
-    if (!payload) {
-      console.log('[REST] JWT verification failed');
-      res.status(401).json({ error: 'Invalid or expired token' });
-      return;
-    }
-
-    const clientId = payload.sub;
-    console.log(`[REST] JWT authenticated: clientId=${clientId}, dappId=${payload.dappId}, tier=${payload.tier}`);
-
     const relayBaseUrl = `${req.protocol}://${req.get('host')}`;
-    const result = await processProofRequest({ ...req.body, clientId }, relayBaseUrl);
+    const result = await processProofRequest(req.body, relayBaseUrl);
     if (!result.ok) {
       res.status(result.code).json({ error: result.error });
       return;
@@ -530,6 +333,12 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
         status.nullifier = result.nullifier;
         status.circuit = result.circuit;
       }
+    }
+
+    // Attach inputsHash if available
+    const inputsHash = await cacheGet(inputsHashKey(requestId));
+    if (inputsHash) {
+      status.inputsHash = inputsHash;
     }
 
     console.log(`[Relay Poll] Response for ${requestId}: status=${status.status}`);
@@ -599,97 +408,8 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
     // Buffer result in Redis for reconnection
     await cacheSet(resultKey(requestId), JSON.stringify(proofResult), RESULT_TTL);
 
-    // Check if plan2 needs on-chain registration first
-    const tierForOnChain = await cacheGet(tierKey(requestId));
-    const circuitForOnChain = await cacheGet(circuitKey(requestId));
-    const needsOnChain = tierForOnChain === 'plan2' && !!circuitForOnChain && status === 'completed' && !!proof && !!publicInputs;
-
-    // Update status — for plan2, delay 'completed' until after on-chain registration
-    if (needsOnChain) {
-      await setStatus(requestId, { status: 'generating' as ProofStatus['status'] });
-    } else {
-      await setStatus(requestId, { status, proof, publicInputs, error });
-    }
-
-    // Credit deduction on completion (logging deferred until after nullifier extraction)
-    if (status === 'completed') {
-      const tier = await cacheGet(tierKey(requestId));
-      const cid = await cacheGet(clientKey(requestId));
-      if (cid && tier === 'credit') {
-        const ok = await deductCredit(cid, 'paid', requestId);
-        if (!ok) {
-          console.warn(`[Relay] Paid credit deduction failed for client ${cid}, request ${requestId}`);
-        }
-      }
-    } else if (status === 'failed') {
-      const tier = await cacheGet(tierKey(requestId));
-      const cid = await cacheGet(clientKey(requestId));
-      const circuit = await cacheGet(circuitKey(requestId));
-      if (cid) {
-        const creditType = tier === 'credit' ? 'paid' : (tier || 'free');
-        logUsage(cid, circuit || '', requestId, creditType, 'failed');
-      }
-    }
-
-    // Extract nullifier/scope for paid tiers
-    let nullifierInfo: { nullifier?: string; scope?: string; onChainStatus?: string; txHash?: string } = {};
-    if (status === 'completed' && proof && publicInputs) {
-      const circuit = await cacheGet(circuitKey(requestId));
-      if (circuit) {
-        nullifierInfo.nullifier = extractNullifierFromPublicInputs(publicInputs, circuit);
-        nullifierInfo.scope = extractScopeFromPublicInputs(publicInputs, circuit);
-      }
-
-      // Plan 2: Auto on-chain registration (with lock to prevent duplicates)
-      const tier = await cacheGet(tierKey(requestId));
-      if (tier === 'plan2' && circuit) {
-        const lockKey = `onchain:lock:${requestId}`;
-        const acquired = await cacheSetNX(lockKey, '1', 300);
-        if (!acquired) {
-          console.log(`[Relay] Plan 2: On-chain registration already in progress for ${requestId}, skipping`);
-          await setStatus(requestId, { status: 'completed' as ProofStatus['status'] });
-        } else {
-          console.log(`[Relay] Plan 2: Registering nullifier on-chain for ${requestId}`);
-          const onChainResult = await registerNullifierOnChain(circuit, proof, publicInputs);
-          nullifierInfo.onChainStatus = onChainResult.status;
-          nullifierInfo.txHash = onChainResult.txHash;
-          if (onChainResult.error) {
-            console.warn(`[Relay] On-chain registration: ${onChainResult.status} - ${onChainResult.error}`);
-          } else {
-            console.log(`[Relay] On-chain registration: ${onChainResult.status} txHash=${onChainResult.txHash}`);
-          }
-
-          // Set completed with on-chain result atomically (was 'generating' until now)
-          await setStatus(requestId, {
-            status: 'completed' as ProofStatus['status'],
-            onChainStatus: onChainResult.status,
-            txHash: onChainResult.txHash,
-            nullifier: nullifierInfo.nullifier,
-          });
-
-          // Log plan2 usage with on-chain data
-          const cidForLog = await cacheGet(clientKey(requestId));
-          if (cidForLog) {
-            logUsage(cidForLog, circuit, requestId, 'plan2', 'completed', {
-              nullifier: nullifierInfo.nullifier,
-              txHash: nullifierInfo.txHash,
-              onChainStatus: nullifierInfo.onChainStatus,
-            });
-          }
-        }
-      }
-
-      // Log completed usage for non-plan2 tiers (with nullifier)
-      if (tier !== 'plan2') {
-        const cid = await cacheGet(clientKey(requestId));
-        if (cid) {
-          const creditType = tier === 'credit' ? 'paid' : (tier || 'free');
-          logUsage(cid, circuit || '', requestId, creditType, 'completed', {
-            nullifier: nullifierInfo.nullifier,
-          });
-        }
-      }
-    }
+    // Update status
+    await setStatus(requestId, { status: status as ProofStatus['status'], proof, publicInputs, error });
 
     // Emit via Socket.IO
     const room = `request:${requestId}`;
@@ -707,78 +427,6 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// REST: GET /api/v1/nullifier/:hash (Plan 2 nullifier query)
-// ---------------------------------------------------------------------------
-app.get('/api/v1/nullifier/:hash', async (req: Request, res: Response) => {
-  try {
-    const hash = req.params.hash as string;
-    console.log(`[Relay] GET /api/v1/nullifier/${hash} from IP: ${req.ip}`);
-    if (!hash || !hash.startsWith('0x')) {
-      res.status(400).json({ error: 'Invalid nullifier hash (must start with 0x)' });
-      return;
-    }
-
-    if (!NULLIFIER_REGISTRY_ADDRESS) {
-      res.status(503).json({ error: 'Nullifier registry not configured' });
-      return;
-    }
-
-    const provider = new ethers.JsonRpcProvider(CHAIN_RPC_URL);
-    const registry = new ethers.Contract(NULLIFIER_REGISTRY_ADDRESS, NULLIFIER_REGISTRY_ABI, provider);
-
-    const [registeredAt, scope, circuitId] = await registry.getNullifierInfo(hash);
-    const registered = BigInt(registeredAt) > 0n;
-
-    console.log(`[Relay] Nullifier ${hash}: registered=${registered}`);
-    res.json({
-      registered,
-      registeredAt: registered ? Number(registeredAt) : null,
-      scope: registered ? scope : null,
-      circuitId: registered ? circuitId : null,
-    });
-  } catch (err: any) {
-    console.error('[REST] Nullifier query error:', err);
-    res.status(500).json({ error: 'Failed to query nullifier registry' });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// REST: POST /api/v1/auth/token (proxy to backend API)
-// ---------------------------------------------------------------------------
-app.post('/api/v1/auth/token', async (req: Request, res: Response) => {
-  try {
-    const { client_id, api_key } = req.body as { client_id?: string; api_key?: string };
-
-    if (!client_id || !api_key) {
-      res.status(400).json({ error: 'client_id and api_key are required' });
-      return;
-    }
-
-    console.log(`[Relay Auth] Token request for client_id=${client_id}`);
-
-    const response = await fetch(`${BACKEND_URL}/api/auth/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ client_id, api_key }),
-    });
-
-    const data = await response.json() as any;
-
-    if (!response.ok) {
-      console.log(`[Relay Auth] Backend rejected: ${response.status} ${data.error || ''}`);
-      res.status(response.status).json(data);
-      return;
-    }
-
-    console.log(`[Relay Auth] Token issued for client_id=${client_id}`);
-    res.json(data);
-  } catch (err: any) {
-    console.error('[Relay Auth] Proxy error:', err.message);
-    res.status(502).json({ error: 'Authentication service unavailable' });
-  }
-});
-
-// ---------------------------------------------------------------------------
 // Health check
 // ---------------------------------------------------------------------------
 app.get('/health', (_req: Request, res: Response) => {
@@ -790,73 +438,34 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// Socket.IO /proof namespace
+// Socket.IO /proof namespace (no JWT middleware — open connections)
 // ---------------------------------------------------------------------------
-
-// Auth middleware: validate JWT token
-proofNs.use(async (socket: Socket, next) => {
-  const token = socket.handshake.auth?.token as string | undefined;
-
-  if (!token) {
-    console.warn(`[Socket.IO] Connection rejected: no JWT token (socket=${socket.id})`);
-    return next(new Error('Authentication error: JWT token required'));
-  }
-
-  const payload = verifyClientToken(token);
-  if (!payload) {
-    console.warn(`[Socket.IO] Connection rejected: invalid/expired JWT (socket=${socket.id})`);
-    return next(new Error('Authentication error: invalid or expired token'));
-  }
-
-  const clientId = payload.sub;
-  console.log(`[Socket.IO] JWT authenticated: clientId=${clientId}, dappId=${payload.dappId}`);
-
-  try {
-    const plan = await getPlan(clientId);
-    // Attach plan to socket data for later use
-    (socket as any).plan = plan;
-    (socket as any).clientId = clientId;
-    next();
-  } catch (err: any) {
-    console.error('[Socket.IO] Auth failed:', err.message);
-    return next(new Error('Authentication error: invalid clientId'));
-  }
-});
-
 proofNs.on('connection', (socket: Socket) => {
-  const clientId = (socket as any).clientId as string;
-  const plan = (socket as any).plan as PlanInfo;
-  console.log(`[Socket.IO] Client connected: ${socket.id} (client=${clientId}, tier=${plan.tier})`);
+  console.log(`[Socket.IO] Client connected: ${socket.id}`);
 
-  // Handle proof request from dApp SDK
+  // proof:request via Socket.IO - require challenge+signature in data
   socket.on('proof:request', async (data: {
     circuitId?: string;
     scope?: string;
     inputs?: Record<string, unknown>;
     nonce?: string;
+    challenge?: string;
+    signature?: string;
   }) => {
     try {
-      const result = await processProofRequest({
-        clientId,
-        ...data,
-      });
-
+      const result = await processProofRequest(data);
       if (!result.ok) {
         socket.emit('proof:error', { error: result.error, code: result.code });
         return;
       }
 
-      // Join the request room for status updates
       socket.join(`request:${result.requestId}`);
 
-      // Send back the request acknowledgment
       socket.emit('proof:status', {
         requestId: result.requestId,
         status: 'pending',
         deepLink: result.deepLink,
       });
-
-      console.log(`[Socket.IO] Proof request from ${clientId}: ${result.requestId}`);
     } catch (err: any) {
       console.error('[Socket.IO] proof:request error:', err);
       socket.emit('proof:error', { error: 'Internal server error' });
