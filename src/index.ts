@@ -13,6 +13,41 @@ import { ethers } from 'ethers';
 dotenv.config();
 
 // ---------------------------------------------------------------------------
+// Log masking — protect sensitive data in server logs
+// ---------------------------------------------------------------------------
+const SENSITIVE_KEYS = new Set(['proof', 'signature', 'challenge', 'nullifier', 'publicInputs']);
+
+/** Mask a hex string: show first 10 + last 6 chars */
+function maskHex(value: string | undefined | null): string {
+  if (!value) return String(value);
+  if (value.length <= 20) return value;
+  return `${value.slice(0, 10)}...${value.slice(-6)}`;
+}
+
+/** Mask publicInputs array: show count only */
+function maskPublicInputs(arr: string[] | undefined | null): string {
+  if (!arr) return String(arr);
+  return `[${arr.length} items]`;
+}
+
+/** Redact sensitive fields from an object for logging */
+function safeStringify(obj: Record<string, unknown>): string {
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === 'proof' && typeof value === 'string') {
+      redacted[key] = maskHex(value);
+    } else if (key === 'publicInputs' && Array.isArray(value)) {
+      redacted[key] = `[${value.length} items]`;
+    } else if (SENSITIVE_KEYS.has(key) && typeof value === 'string') {
+      redacted[key] = maskHex(value);
+    } else {
+      redacted[key] = value;
+    }
+  }
+  return JSON.stringify(redacted);
+}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT || '4001', 10);
@@ -102,7 +137,7 @@ setInterval(() => {
 function challengeKey(challenge: string) { return `challenge:${challenge}`; }
 
 async function verifyChallenge(challenge: string, signature: string): Promise<{ valid: boolean; signerAddress?: string; error?: string }> {
-  console.log(`[Relay Auth] verifyChallenge: challenge=${challenge}, signature=${signature}`);
+  console.log(`[Relay Auth] verifyChallenge: challenge=${maskHex(challenge)}, signature=${maskHex(signature)}`);
 
   if (!challenge || !signature) {
     console.log(`[Relay Auth] verifyChallenge failed: missing fields — challenge=${!!challenge}, signature=${!!signature}`);
@@ -112,7 +147,7 @@ async function verifyChallenge(challenge: string, signature: string): Promise<{ 
   // Check challenge exists in Redis (prevents replay)
   const stored = await cacheGet(challengeKey(challenge));
   if (!stored) {
-    console.log(`[Relay Auth] verifyChallenge failed: challenge not found in Redis (expired or already used) — challenge=${challenge}`);
+    console.log(`[Relay Auth] verifyChallenge failed: challenge not found in Redis (expired or already used) — challenge=${maskHex(challenge)}`);
     return { valid: false, error: 'Invalid or expired challenge' };
   }
   console.log(`[Relay Auth] Challenge found in Redis: ${stored}`);
@@ -202,7 +237,7 @@ async function processProofRequest(body: {
 }, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
   const { circuitId, scope, inputs, nonce, challenge, signature } = body;
 
-  console.log(`[Relay] processProofRequest: circuitId=${circuitId}, scope=${scope || 'none'}, inputs=${inputs ? JSON.stringify(inputs) : 'none'}, nonce=${nonce || 'none'}, challenge=${challenge || 'none'}, signature=${signature || 'none'}`);
+  console.log(`[Relay] processProofRequest: circuitId=${circuitId}, scope=${scope || 'none'}, inputs=${inputs ? JSON.stringify(inputs) : 'none'}, nonce=${nonce || 'none'}, challenge=${maskHex(challenge)}, signature=${maskHex(signature)}`);
 
   // Verify challenge-signature
   if (!challenge || !signature) {
@@ -254,7 +289,7 @@ async function processProofRequest(body: {
     callbackUrl: relayCallbackUrl,
     createdAt: now,
   };
-  console.log(`[Relay] ProofRequest object: ${JSON.stringify(proofRequest)}`);
+  console.log(`[Relay] ProofRequest object: ${safeStringify(proofRequest as unknown as Record<string, unknown>)}`);
 
   // Compute and store inputs hash for deep link integrity verification
   const inputsHash = computeInputsHash(inputs);
@@ -296,7 +331,7 @@ app.get('/api/v1/challenge', rateLimit('challenge'), async (req: Request, res: R
     const redisValue = JSON.stringify({ createdAt: Date.now(), ip: req.ip });
     await cacheSet(challengeKey(challenge), redisValue, CHALLENGE_TTL);
 
-    console.log(`[Relay Challenge] Generated: challenge=${challenge}, expiresAt=${expiresAt}, ttl=${CHALLENGE_TTL}s, ip=${req.ip}`);
+    console.log(`[Relay Challenge] Generated: challenge=${maskHex(challenge)}, expiresAt=${expiresAt}, ttl=${CHALLENGE_TTL}s, ip=${req.ip}`);
 
     res.json({ challenge, expiresAt });
   } catch (err: any) {
@@ -311,7 +346,7 @@ app.get('/api/v1/challenge', rateLimit('challenge'), async (req: Request, res: R
 app.post('/api/v1/proof/request', rateLimit('request'), async (req: Request, res: Response) => {
   try {
     const relayBaseUrl = `${req.protocol}://${req.get('host')}`;
-    console.log(`[Relay REST] POST /api/v1/proof/request from IP: ${req.ip}, relayBaseUrl=${relayBaseUrl}, body=${JSON.stringify(req.body)}`);
+    console.log(`[Relay REST] POST /api/v1/proof/request from IP: ${req.ip}, relayBaseUrl=${relayBaseUrl}, body=${safeStringify(req.body || {})}`);
 
     const result = await processProofRequest(req.body, relayBaseUrl);
     if (!result.ok) {
@@ -362,7 +397,7 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
         status.chainId = result.chainId;
         status.nullifier = result.nullifier;
         status.circuit = result.circuit;
-        console.log(`[Relay Poll] Attached buffered result for ${requestId}: proof=${result.proof}, publicInputs=${JSON.stringify(result.publicInputs)}, nullifier=${result.nullifier}, verifierAddress=${result.verifierAddress}, chainId=${result.chainId}, circuit=${result.circuit}, error=${result.error}`);
+        console.log(`[Relay Poll] Attached buffered result for ${requestId}: proof=${maskHex(result.proof)}, publicInputs=${maskPublicInputs(result.publicInputs)}, nullifier=${maskHex(result.nullifier)}, verifierAddress=${result.verifierAddress}, chainId=${result.chainId}, circuit=${result.circuit}, error=${result.error}`);
       } else {
         console.log(`[Relay Poll] No buffered result found for ${requestId} (result expired from Redis)`);
       }
@@ -377,7 +412,7 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
       console.log(`[Relay Poll] No inputsHash found for ${requestId} (expired from Redis)`);
     }
 
-    console.log(`[Relay Poll] Full response for ${requestId}: ${JSON.stringify(status)}`);
+    console.log(`[Relay Poll] Full response for ${requestId}: ${safeStringify(status as unknown as Record<string, unknown>)}`);
     res.json(status);
   } catch (err: any) {
     console.error('[Relay Poll] Error:', err);
@@ -389,7 +424,7 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
 // REST: POST /api/v1/proof/callback  (ZKProofport app posts result here)
 // ---------------------------------------------------------------------------
 app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
-  console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${req.ip}, body=${JSON.stringify(req.body)}`);
+  console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${req.ip}, body=${safeStringify(req.body || {})}`);
   try {
     const { requestId, status, proof, publicInputs, error, verifierAddress, chainId, nullifier, circuit } = req.body as {
       requestId?: string;
@@ -403,7 +438,7 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
       circuit?: string;
     };
 
-    console.log(`[Relay Callback] Parsed fields: requestId=${requestId}, status=${status}, circuit=${circuit}, proof=${proof}, publicInputs=${JSON.stringify(publicInputs)}, nullifier=${nullifier}, verifierAddress=${verifierAddress}, chainId=${chainId}, error=${error}`);
+    console.log(`[Relay Callback] Parsed fields: requestId=${requestId}, status=${status}, circuit=${circuit}, proof=${maskHex(proof)}, publicInputs=${maskPublicInputs(publicInputs)}, nullifier=${maskHex(nullifier)}, verifierAddress=${verifierAddress}, chainId=${chainId}, error=${error}`);
 
     if (!requestId || !status) {
       console.log(`[Relay Callback] Rejected: missing required fields — requestId=${requestId}, status=${status}`);
@@ -441,7 +476,7 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
       circuit,
       completedAt: new Date().toISOString(),
     };
-    console.log(`[Relay Callback] ProofResult object: ${JSON.stringify(proofResult)}`);
+    console.log(`[Relay Callback] ProofResult object: ${safeStringify(proofResult as unknown as Record<string, unknown>)}`);
 
     // Buffer result in Redis for reconnection
     await cacheSet(resultKey(requestId), JSON.stringify(proofResult), RESULT_TTL);
@@ -457,7 +492,7 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
     proofNs.to(room).emit('proof:result', proofResult);
 
     res.json({ received: true });
-    console.log(`[Relay Callback] Successfully processed: requestId=${requestId}, status=${status}, circuit=${circuit}, nullifier=${nullifier}, verifierAddress=${verifierAddress}, chainId=${chainId}`);
+    console.log(`[Relay Callback] Successfully processed: requestId=${requestId}, status=${status}, circuit=${circuit}, nullifier=${maskHex(nullifier)}, verifierAddress=${verifierAddress}, chainId=${chainId}`);
   } catch (err: any) {
     console.error('[Relay Callback] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -490,7 +525,7 @@ proofNs.on('connection', (socket: Socket) => {
     challenge?: string;
     signature?: string;
   }) => {
-    console.log(`[Socket.IO] proof:request from ${socket.id}: ${JSON.stringify(data)}`);
+    console.log(`[Socket.IO] proof:request from ${socket.id}: ${safeStringify(data as unknown as Record<string, unknown>)}`);
     try {
       const result = await processProofRequest(data);
       if (!result.ok) {
