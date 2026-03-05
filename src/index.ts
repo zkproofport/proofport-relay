@@ -78,6 +78,7 @@ function rateLimit(type: keyof typeof RATE_LIMITS) {
     }
 
     if (entry.count >= limit.max) {
+      console.log(`[Relay RateLimit] Rejected: type=${type}, ip=${ip}, count=${entry.count}, max=${limit.max}, resetsAt=${new Date(entry.resetAt).toISOString()}`);
       res.status(429).json({ error: 'Too many requests. Please try again later.' });
       return;
     }
@@ -101,15 +102,20 @@ setInterval(() => {
 function challengeKey(challenge: string) { return `challenge:${challenge}`; }
 
 async function verifyChallenge(challenge: string, signature: string): Promise<{ valid: boolean; signerAddress?: string; error?: string }> {
+  console.log(`[Relay Auth] verifyChallenge: challenge=${challenge}, signature=${signature}`);
+
   if (!challenge || !signature) {
+    console.log(`[Relay Auth] verifyChallenge failed: missing fields — challenge=${!!challenge}, signature=${!!signature}`);
     return { valid: false, error: 'challenge and signature are required' };
   }
 
   // Check challenge exists in Redis (prevents replay)
   const stored = await cacheGet(challengeKey(challenge));
   if (!stored) {
+    console.log(`[Relay Auth] verifyChallenge failed: challenge not found in Redis (expired or already used) — challenge=${challenge}`);
     return { valid: false, error: 'Invalid or expired challenge' };
   }
+  console.log(`[Relay Auth] Challenge found in Redis: ${stored}`);
 
   try {
     // Recover signer address from EIP-191 personal_sign
@@ -118,8 +124,10 @@ async function verifyChallenge(challenge: string, signature: string): Promise<{ 
     // Delete challenge from Redis (one-time use)
     await cacheDel(challengeKey(challenge));
 
+    console.log(`[Relay Auth] verifyChallenge success: signerAddress=${signerAddress}`);
     return { valid: true, signerAddress };
   } catch (err: any) {
+    console.log(`[Relay Auth] verifyChallenge failed: signature recovery error — ${err.message}`);
     return { valid: false, error: 'Invalid signature' };
   }
 }
@@ -128,8 +136,11 @@ async function verifyChallenge(challenge: string, signature: string): Promise<{ 
 // Inputs hash
 // ---------------------------------------------------------------------------
 function computeInputsHash(inputs: Record<string, unknown>): string {
-  const canonical = JSON.stringify(inputs, Object.keys(inputs).sort());
-  return createHash('sha256').update(canonical).digest('hex');
+  const sortedKeys = Object.keys(inputs).sort();
+  const canonical = JSON.stringify(inputs, sortedKeys);
+  const hash = createHash('sha256').update(canonical).digest('hex');
+  console.log(`[Relay Hash] computeInputsHash: sortedKeys=${JSON.stringify(sortedKeys)}, canonical=${canonical}, hash=${hash}`);
+  return hash;
 }
 
 function inputsHashKey(requestId: string) { return `proof:inputsHash:${requestId}`; }
@@ -138,8 +149,11 @@ function inputsHashKey(requestId: string) { return `proof:inputsHash:${requestId
 // Deep link generation
 // ---------------------------------------------------------------------------
 function buildDeepLink(request: ProofRequest): string {
-  const data = Buffer.from(JSON.stringify(request)).toString('base64url');
-  return `zkproofport://proof-request?data=${data}`;
+  const jsonPayload = JSON.stringify(request);
+  const data = Buffer.from(jsonPayload).toString('base64url');
+  const deepLink = `zkproofport://proof-request?data=${data}`;
+  console.log(`[Relay DeepLink] buildDeepLink: requestId=${request.requestId}, jsonPayload=${jsonPayload}, base64url=${data}, deepLink=${deepLink}`);
+  return deepLink;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,21 +202,22 @@ async function processProofRequest(body: {
 }, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
   const { circuitId, scope, inputs, nonce, challenge, signature } = body;
 
-  console.log(`[Relay] processProofRequest: circuitId=${circuitId}, scope=${scope || 'none'}, inputKeys=${inputs ? Object.keys(inputs).join(',') : 'none'}, nonce=${nonce || 'none'}`);
+  console.log(`[Relay] processProofRequest: circuitId=${circuitId}, scope=${scope || 'none'}, inputs=${inputs ? JSON.stringify(inputs) : 'none'}, nonce=${nonce || 'none'}, challenge=${challenge || 'none'}, signature=${signature || 'none'}`);
 
   // Verify challenge-signature
   if (!challenge || !signature) {
+    console.log(`[Relay] processProofRequest rejected: missing auth fields — challenge=${!!challenge}, signature=${!!signature}`);
     return { ok: false, error: 'challenge and signature are required', code: 401 };
   }
 
   const challengeResult = await verifyChallenge(challenge, signature);
   if (!challengeResult.valid) {
-    console.log(`[Relay] Challenge verification failed: ${challengeResult.error}`);
+    console.log(`[Relay] processProofRequest rejected: challenge verification failed — ${challengeResult.error}`);
     return { ok: false, error: challengeResult.error!, code: 401 };
   }
 
   const signerAddress = challengeResult.signerAddress!;
-  console.log(`[Relay] Challenge verified, signer: ${signerAddress}`);
+  console.log(`[Relay] processProofRequest: challenge verified, signerAddress=${signerAddress}`);
 
   // Validate required fields
   if (!circuitId || typeof circuitId !== 'string') {
@@ -216,9 +231,11 @@ async function processProofRequest(body: {
   if (nonce) {
     const seen = await cacheGet(nonceKey(nonce));
     if (seen) {
+      console.log(`[Relay] processProofRequest rejected: duplicate nonce=${nonce}`);
       return { ok: false, error: 'Duplicate nonce (replay detected)', code: 409 };
     }
     await cacheSet(nonceKey(nonce), '1', NONCE_TTL);
+    console.log(`[Relay] Nonce stored: nonce=${nonce}, ttl=${NONCE_TTL}s`);
   }
 
   const requestId = uuidv4();
@@ -226,6 +243,7 @@ async function processProofRequest(body: {
   const effectiveScope = scope || '';
 
   const relayCallbackUrl = `${RELAY_EXTERNAL_URL || relayBaseUrl || `http://localhost:${PORT}`}/api/v1/proof/callback`;
+  console.log(`[Relay] processProofRequest: requestId=${requestId}, callbackUrl=${relayCallbackUrl}, effectiveScope=${effectiveScope}`);
 
   const proofRequest: ProofRequest = {
     requestId,
@@ -236,24 +254,28 @@ async function processProofRequest(body: {
     callbackUrl: relayCallbackUrl,
     createdAt: now,
   };
+  console.log(`[Relay] ProofRequest object: ${JSON.stringify(proofRequest)}`);
 
   // Compute and store inputs hash for deep link integrity verification
   const inputsHash = computeInputsHash(inputs);
   await cacheSet(inputsHashKey(requestId), inputsHash, STATUS_TTL);
+  console.log(`[Relay] InputsHash stored: requestId=${requestId}, inputsHash=${inputsHash}, ttl=${STATUS_TTL}s`);
 
   // Set initial status
+  const deepLink = buildDeepLink(proofRequest);
   const status: ProofStatus = {
     requestId,
     status: 'pending',
-    deepLink: buildDeepLink(proofRequest),
+    deepLink,
     createdAt: now,
     updatedAt: now,
   };
   await cacheSet(statusKey(requestId), JSON.stringify(status), STATUS_TTL);
+  console.log(`[Relay] Status stored: requestId=${requestId}, status=pending, ttl=${STATUS_TTL}s`);
 
   proofNs.to(`request:${requestId}`).emit('proof:status', { requestId, status: 'pending' });
 
-  console.log(`[Relay] Proof request created: ${requestId} (signer=${signerAddress}, circuit=${circuitId})`);
+  console.log(`[Relay] Proof request created successfully: requestId=${requestId}, signerAddress=${signerAddress}, circuitId=${circuitId}, inputsHash=${inputsHash}, callbackUrl=${relayCallbackUrl}`);
 
   return { ok: true, requestId, deepLink: status.deepLink!, status };
 }
@@ -263,22 +285,22 @@ async function processProofRequest(body: {
 // ---------------------------------------------------------------------------
 app.get('/api/v1/challenge', rateLimit('challenge'), async (req: Request, res: Response) => {
   try {
+    console.log(`[Relay Challenge] GET /api/v1/challenge from IP: ${req.ip}`);
+
     // Generate random 32-byte challenge
     const challengeBytes = ethers.randomBytes(32);
     const challenge = ethers.hexlify(challengeBytes);
+    const expiresAt = Date.now() + (CHALLENGE_TTL * 1000);
 
     // Store in Redis with TTL
-    await cacheSet(challengeKey(challenge), JSON.stringify({
-      createdAt: Date.now(),
-      ip: req.ip,
-    }), CHALLENGE_TTL);
+    const redisValue = JSON.stringify({ createdAt: Date.now(), ip: req.ip });
+    await cacheSet(challengeKey(challenge), redisValue, CHALLENGE_TTL);
 
-    res.json({
-      challenge,
-      expiresAt: Date.now() + (CHALLENGE_TTL * 1000),
-    });
+    console.log(`[Relay Challenge] Generated: challenge=${challenge}, expiresAt=${expiresAt}, ttl=${CHALLENGE_TTL}s, ip=${req.ip}`);
+
+    res.json({ challenge, expiresAt });
   } catch (err: any) {
-    console.error('[REST] Challenge generation error:', err);
+    console.error('[Relay Challenge] Generation error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -289,19 +311,25 @@ app.get('/api/v1/challenge', rateLimit('challenge'), async (req: Request, res: R
 app.post('/api/v1/proof/request', rateLimit('request'), async (req: Request, res: Response) => {
   try {
     const relayBaseUrl = `${req.protocol}://${req.get('host')}`;
+    console.log(`[Relay REST] POST /api/v1/proof/request from IP: ${req.ip}, relayBaseUrl=${relayBaseUrl}, body=${JSON.stringify(req.body)}`);
+
     const result = await processProofRequest(req.body, relayBaseUrl);
     if (!result.ok) {
+      console.log(`[Relay REST] POST /api/v1/proof/request failed: code=${result.code}, error=${result.error}`);
       res.status(result.code).json({ error: result.error });
       return;
     }
-    res.status(201).json({
+
+    const response = {
       requestId: result.requestId,
       deepLink: result.deepLink,
       status: result.status.status,
       pollUrl: `/api/v1/proof/${result.requestId}`,
-    });
+    };
+    console.log(`[Relay REST] POST /api/v1/proof/request success: ${JSON.stringify(response)}`);
+    res.status(201).json(response);
   } catch (err: any) {
-    console.error('[REST] Proof request error:', err);
+    console.error('[Relay REST] Proof request error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -315,10 +343,12 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
     console.log(`[Relay Poll] GET /api/v1/proof/${requestId} from IP: ${req.ip}`);
     const status = await getStatus(requestId);
     if (!status) {
-      console.log(`[Relay Poll] Request ${requestId} not found or expired`);
+      console.log(`[Relay Poll] Request ${requestId} not found or expired (no status in Redis)`);
       res.status(404).json({ error: 'Request not found or expired' });
       return;
     }
+
+    console.log(`[Relay Poll] Status found for ${requestId}: status=${status.status}, createdAt=${status.createdAt}, updatedAt=${status.updatedAt}`);
 
     // If completed, attach buffered result
     if (status.status === 'completed' || status.status === 'failed') {
@@ -332,6 +362,9 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
         status.chainId = result.chainId;
         status.nullifier = result.nullifier;
         status.circuit = result.circuit;
+        console.log(`[Relay Poll] Attached buffered result for ${requestId}: proof=${result.proof}, publicInputs=${JSON.stringify(result.publicInputs)}, nullifier=${result.nullifier}, verifierAddress=${result.verifierAddress}, chainId=${result.chainId}, circuit=${result.circuit}, error=${result.error}`);
+      } else {
+        console.log(`[Relay Poll] No buffered result found for ${requestId} (result expired from Redis)`);
       }
     }
 
@@ -339,12 +372,15 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
     const inputsHash = await cacheGet(inputsHashKey(requestId));
     if (inputsHash) {
       status.inputsHash = inputsHash;
+      console.log(`[Relay Poll] InputsHash for ${requestId}: ${inputsHash}`);
+    } else {
+      console.log(`[Relay Poll] No inputsHash found for ${requestId} (expired from Redis)`);
     }
 
-    console.log(`[Relay Poll] Response for ${requestId}: status=${status.status}`);
+    console.log(`[Relay Poll] Full response for ${requestId}: ${JSON.stringify(status)}`);
     res.json(status);
   } catch (err: any) {
-    console.error('[REST] Poll error:', err);
+    console.error('[Relay Poll] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -353,10 +389,7 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
 // REST: POST /api/v1/proof/callback  (ZKProofport app posts result here)
 // ---------------------------------------------------------------------------
 app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
-  console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${req.ip}`);
-  const { proof: _proof, publicInputs: _pi, ...bodyWithoutProof } = req.body || {};
-  console.log(`[Relay Callback] Body (excluding proof/publicInputs):`, JSON.stringify(bodyWithoutProof));
-  console.log(`[Relay Callback] hasProof: ${!!_proof}, publicInputs: ${_pi?.length ?? 0} items`);
+  console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${req.ip}, body=${JSON.stringify(req.body)}`);
   try {
     const { requestId, status, proof, publicInputs, error, verifierAddress, chainId, nullifier, circuit } = req.body as {
       requestId?: string;
@@ -370,7 +403,10 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
       circuit?: string;
     };
 
+    console.log(`[Relay Callback] Parsed fields: requestId=${requestId}, status=${status}, circuit=${circuit}, proof=${proof}, publicInputs=${JSON.stringify(publicInputs)}, nullifier=${nullifier}, verifierAddress=${verifierAddress}, chainId=${chainId}, error=${error}`);
+
     if (!requestId || !status) {
+      console.log(`[Relay Callback] Rejected: missing required fields — requestId=${requestId}, status=${status}`);
       res.status(400).json({ error: 'requestId and status are required' });
       return;
     }
@@ -378,16 +414,17 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
     // Validate requestId was created by this relay (exists in Redis)
     const existingStatus = await getStatus(requestId);
     if (!existingStatus) {
-      console.log(`[Relay Callback] Rejected: unknown requestId ${requestId}`);
+      console.log(`[Relay Callback] Rejected: unknown requestId=${requestId} (not found in Redis — expired or never created)`);
       res.status(404).json({ error: 'Unknown or expired requestId' });
       return;
     }
+    console.log(`[Relay Callback] Existing status for ${requestId}: ${JSON.stringify(existingStatus)}`);
 
     if (status !== 'completed' && status !== 'failed' && status !== 'error') {
       // Intermediate status update (e.g. "generating")
       await setStatus(requestId, { status: status as ProofStatus['status'] });
       proofNs.to(`request:${requestId}`).emit('proof:status', { requestId, status });
-      console.log(`[Relay Callback] Intermediate status update: ${requestId} -> ${status}`);
+      console.log(`[Relay Callback] Intermediate status update: requestId=${requestId}, status=${status}`);
       res.json({ received: true });
       return;
     }
@@ -404,9 +441,11 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
       circuit,
       completedAt: new Date().toISOString(),
     };
+    console.log(`[Relay Callback] ProofResult object: ${JSON.stringify(proofResult)}`);
 
     // Buffer result in Redis for reconnection
     await cacheSet(resultKey(requestId), JSON.stringify(proofResult), RESULT_TTL);
+    console.log(`[Relay Callback] Result buffered in Redis: requestId=${requestId}, ttl=${RESULT_TTL}s`);
 
     // Update status
     await setStatus(requestId, { status: status as ProofStatus['status'], proof, publicInputs, error });
@@ -414,14 +453,13 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
     // Emit via Socket.IO
     const room = `request:${requestId}`;
     const sockets = await proofNs.in(room).fetchSockets();
-    console.log(`[Socket.IO] Emitting proof:result to room=${room}, sockets=${sockets.length}`);
+    console.log(`[Relay Callback] Socket.IO emit: room=${room}, connectedSockets=${sockets.length}, socketIds=${sockets.map(s => s.id).join(',')}`);
     proofNs.to(room).emit('proof:result', proofResult);
 
-    console.log(`[Relay] Proof result received: ${requestId} (status=${status})`);
     res.json({ received: true });
-    console.log(`[Relay Callback] Successfully processed callback for ${requestId} (status=${status}, circuit=${circuit || 'unknown'})`);
+    console.log(`[Relay Callback] Successfully processed: requestId=${requestId}, status=${status}, circuit=${circuit}, nullifier=${nullifier}, verifierAddress=${verifierAddress}, chainId=${chainId}`);
   } catch (err: any) {
-    console.error('[REST] Callback error:', err);
+    console.error('[Relay Callback] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -452,14 +490,17 @@ proofNs.on('connection', (socket: Socket) => {
     challenge?: string;
     signature?: string;
   }) => {
+    console.log(`[Socket.IO] proof:request from ${socket.id}: ${JSON.stringify(data)}`);
     try {
       const result = await processProofRequest(data);
       if (!result.ok) {
+        console.log(`[Socket.IO] proof:request failed for ${socket.id}: code=${result.code}, error=${result.error}`);
         socket.emit('proof:error', { error: result.error, code: result.code });
         return;
       }
 
       socket.join(`request:${result.requestId}`);
+      console.log(`[Socket.IO] Socket ${socket.id} joined room request:${result.requestId}, deepLink=${result.deepLink}`);
 
       socket.emit('proof:status', {
         requestId: result.requestId,
