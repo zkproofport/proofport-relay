@@ -15,7 +15,7 @@ dotenv.config();
 // ---------------------------------------------------------------------------
 // Log masking — protect sensitive data in server logs
 // ---------------------------------------------------------------------------
-const SENSITIVE_KEYS = new Set(['proof', 'signature', 'challenge', 'nullifier', 'publicInputs']);
+const SENSITIVE_KEYS = new Set(['proof', 'signature', 'challenge', 'publicInputs']);
 
 /** Mask a hex string: show first 10 + last 6 chars */
 function maskHex(value: string | undefined | null): string {
@@ -395,9 +395,8 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
         status.error = result.error;
         status.verifierAddress = result.verifierAddress;
         status.chainId = result.chainId;
-        status.nullifier = result.nullifier;
         status.circuit = result.circuit;
-        console.log(`[Relay Poll] Attached buffered result for ${requestId}: proof=${maskHex(result.proof)}, publicInputs=${maskPublicInputs(result.publicInputs)}, nullifier=${maskHex(result.nullifier)}, verifierAddress=${result.verifierAddress}, chainId=${result.chainId}, circuit=${result.circuit}, error=${result.error}`);
+        console.log(`[Relay Poll] Attached buffered result for ${requestId}: proof=${maskHex(result.proof)}, publicInputs=${maskPublicInputs(result.publicInputs)}, verifierAddress=${result.verifierAddress}, chainId=${result.chainId}, circuit=${result.circuit}, error=${result.error}`);
       } else {
         console.log(`[Relay Poll] No buffered result found for ${requestId} (result expired from Redis)`);
       }
@@ -426,7 +425,7 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
 app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
   console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${req.ip}, body=${safeStringify(req.body || {})}`);
   try {
-    const { requestId, status, proof, publicInputs, error, verifierAddress, chainId, nullifier, circuit } = req.body as {
+    const { requestId, status, proof, publicInputs, error, verifierAddress, chainId, circuit } = req.body as {
       requestId?: string;
       status?: string;
       proof?: string;
@@ -434,11 +433,10 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
       error?: string;
       verifierAddress?: string;
       chainId?: number;
-      nullifier?: string;
       circuit?: string;
     };
 
-    console.log(`[Relay Callback] Parsed fields: requestId=${requestId}, status=${status}, circuit=${circuit}, proof=${maskHex(proof)}, publicInputs=${maskPublicInputs(publicInputs)}, nullifier=${maskHex(nullifier)}, verifierAddress=${verifierAddress}, chainId=${chainId}, error=${error}`);
+    console.log(`[Relay Callback] Parsed fields: requestId=${requestId}, status=${status}, circuit=${circuit}, proof=${maskHex(proof)}, publicInputs=${maskPublicInputs(publicInputs)}, verifierAddress=${verifierAddress}, chainId=${chainId}, error=${error}`);
 
     if (!requestId || !status) {
       console.log(`[Relay Callback] Rejected: missing required fields — requestId=${requestId}, status=${status}`);
@@ -472,7 +470,6 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
       error,
       verifierAddress,
       chainId,
-      nullifier,
       circuit,
       completedAt: new Date().toISOString(),
     };
@@ -492,7 +489,7 @@ app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
     proofNs.to(room).emit('proof:result', proofResult);
 
     res.json({ received: true });
-    console.log(`[Relay Callback] Successfully processed: requestId=${requestId}, status=${status}, circuit=${circuit}, nullifier=${maskHex(nullifier)}, verifierAddress=${verifierAddress}, chainId=${chainId}`);
+    console.log(`[Relay Callback] Successfully processed: requestId=${requestId}, status=${status}, circuit=${circuit}, verifierAddress=${verifierAddress}, chainId=${chainId}`);
   } catch (err: any) {
     console.error('[Relay Callback] Error:', err);
     res.status(500).json({ error: 'Internal server error' });

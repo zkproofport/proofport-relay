@@ -168,7 +168,6 @@ describe('Relay E2E: Challenge-Signature Auth Flow', () => {
           publicInputs: ['0x1', '0x2'],
           verifierAddress: '0x1234567890abcdef1234567890abcdef12345678',
           chainId: 84532,
-          nullifier: '0xnullifier',
           circuit: 'coinbase_attestation',
         }),
       });

@@ -22,7 +22,6 @@ export interface ProofResult {
   error?: string;
   verifierAddress?: string;
   chainId?: number;
-  nullifier?: string;
   circuit?: string;
   completedAt: string;
 }
@@ -35,7 +34,6 @@ export interface ProofStatus {
   error?: string;
   verifierAddress?: string;
   chainId?: number;
-  nullifier?: string;
   circuit?: string;
   deepLink?: string;
   inputsHash?: string;
