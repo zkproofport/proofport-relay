@@ -234,6 +234,9 @@ async function processProofRequest(body: {
   nonce?: string;
   challenge?: string;
   signature?: string;
+  dappName?: string;
+  dappIcon?: string;
+  message?: string;
 }, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
   const { circuitId, scope, inputs, nonce, challenge, signature } = body;
 
@@ -287,6 +290,9 @@ async function processProofRequest(body: {
     scope: effectiveScope,
     inputs,
     callbackUrl: relayCallbackUrl,
+    ...(body.dappName && { dappName: body.dappName }),
+    ...(body.dappIcon && { dappIcon: body.dappIcon }),
+    ...(body.message && { message: body.message }),
     createdAt: now,
   };
   console.log(`[Relay] ProofRequest object: ${safeStringify(proofRequest as unknown as Record<string, unknown>)}`);

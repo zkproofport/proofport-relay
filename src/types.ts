@@ -11,6 +11,9 @@ export interface ProofRequest {
   inputs: Record<string, unknown>;
   inputsHash?: string;
   callbackUrl?: string;
+  dappName?: string;
+  dappIcon?: string;
+  message?: string;
   createdAt: string;
 }
 
