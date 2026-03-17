@@ -6,8 +6,8 @@ import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
 import { createHash } from 'crypto';
-import { initRedis, cacheSet, cacheGet, cacheDel } from './redis';
-import type { ProofRequest, ProofResult, ProofStatus } from './types';
+import { initRedis, cacheSet, cacheGet } from './redis';
+import type { ProofRequest, ProofResult, ProofStatus, ProofSession } from './types';
 import { ethers } from 'ethers';
 
 dotenv.config();
@@ -62,7 +62,7 @@ const CORS_ORIGIN: string | string[] = process.env.CORS_ORIGIN
 const RESULT_TTL = 300; // 5 minutes
 const STATUS_TTL = 600; // 10 minutes
 const NONCE_TTL = 600;  // 10 minutes (replay prevention)
-const CHALLENGE_TTL = 120; // 2 minutes
+// CHALLENGE_TTL replaced by SESSION_TTL in session management
 
 if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.RELAY_EXTERNAL_URL) {
   throw new Error('RELAY_EXTERNAL_URL environment variable is required in production/staging');
@@ -132,37 +132,61 @@ setInterval(() => {
 }, 300_000);
 
 // ---------------------------------------------------------------------------
-// Challenge-signature auth
+// Session management (Redis-backed)
 // ---------------------------------------------------------------------------
-function challengeKey(challenge: string) { return `challenge:${challenge}`; }
+const SESSION_KEY_PREFIX = 'session:';
+const SESSION_TTL = 600; // 10 minutes
 
-async function verifyChallenge(challenge: string, signature: string): Promise<{ valid: boolean; signerAddress?: string; error?: string }> {
-  console.log(`[Relay Auth] verifyChallenge: challenge=${maskHex(challenge)}, signature=${maskHex(signature)}`);
+function sessionKey(requestId: string) { return `${SESSION_KEY_PREFIX}${requestId}`; }
 
-  if (!challenge || !signature) {
-    console.log(`[Relay Auth] verifyChallenge failed: missing fields — challenge=${!!challenge}, signature=${!!signature}`);
-    return { valid: false, error: 'challenge and signature are required' };
+async function createSession(ip: string): Promise<ProofSession> {
+  const requestId = uuidv4();
+  const challengeBytes = ethers.randomBytes(32);
+  const challenge = ethers.hexlify(challengeBytes);
+  const now = new Date();
+
+  const session: ProofSession = {
+    requestId,
+    challenge,
+    status: 'pending',
+    ip,
+    createdAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + SESSION_TTL * 1000).toISOString(),
+  };
+
+  await cacheSet(sessionKey(requestId), JSON.stringify(session), SESSION_TTL);
+  console.log(`[Relay Session] Created: requestId=${requestId}, challenge=${maskHex(challenge)}, ip=${ip}`);
+  return session;
+}
+
+async function getSession(requestId: string): Promise<ProofSession | null> {
+  const data = await cacheGet(sessionKey(requestId));
+  if (!data) return null;
+  return JSON.parse(data) as ProofSession;
+}
+
+async function updateSession(requestId: string, updates: Partial<ProofSession>): Promise<void> {
+  const session = await getSession(requestId);
+  if (!session) return;
+  const updated = { ...session, ...updates };
+  const ttl = Math.max(1, Math.floor((new Date(session.expiresAt).getTime() - Date.now()) / 1000));
+  await cacheSet(sessionKey(requestId), JSON.stringify(updated), ttl > 0 ? ttl : SESSION_TTL);
+}
+
+/**
+ * Verify challenge-signature for circuits that require wallet signing (e.g., Coinbase).
+ * Returns the recovered signer address for use as circuit input.
+ */
+async function verifyWalletSignature(challenge: string, signature: string): Promise<{ valid: boolean; signerAddress?: string; error?: string }> {
+  if (!signature) {
+    return { valid: false, error: 'signature is required for this circuit' };
   }
-
-  // Check challenge exists in Redis (prevents replay)
-  const stored = await cacheGet(challengeKey(challenge));
-  if (!stored) {
-    console.log(`[Relay Auth] verifyChallenge failed: challenge not found in Redis (expired or already used) — challenge=${maskHex(challenge)}`);
-    return { valid: false, error: 'Invalid or expired challenge' };
-  }
-  console.log(`[Relay Auth] Challenge found in Redis: ${stored}`);
-
   try {
-    // Recover signer address from EIP-191 personal_sign
     const signerAddress = ethers.verifyMessage(challenge, signature);
-
-    // Delete challenge from Redis (one-time use)
-    await cacheDel(challengeKey(challenge));
-
-    console.log(`[Relay Auth] verifyChallenge success: signerAddress=${signerAddress}`);
+    console.log(`[Relay Auth] Wallet signature verified: signerAddress=${signerAddress}`);
     return { valid: true, signerAddress };
   } catch (err: any) {
-    console.log(`[Relay Auth] verifyChallenge failed: signature recovery error — ${err.message}`);
+    console.log(`[Relay Auth] Wallet signature verification failed: ${err.message}`);
     return { valid: false, error: 'Invalid signature' };
   }
 }
@@ -227,7 +251,11 @@ async function getStatus(requestId: string): Promise<ProofStatus | null> {
 // ---------------------------------------------------------------------------
 // Core proof request processing
 // ---------------------------------------------------------------------------
+// Circuits that require wallet signature (used as circuit input for on-chain verification)
+const WALLET_SIGNATURE_CIRCUITS = ['coinbase_attestation', 'coinbase_country_attestation'];
+
 async function processProofRequest(body: {
+  requestId?: string;
   circuitId?: string;
   scope?: string;
   inputs?: Record<string, unknown>;
@@ -238,24 +266,30 @@ async function processProofRequest(body: {
   dappIcon?: string;
   message?: string;
 }, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
-  const { circuitId, scope, inputs, nonce, challenge, signature } = body;
+  const { requestId: reqId, circuitId, scope, inputs, nonce, challenge, signature } = body;
 
-  console.log(`[Relay] processProofRequest: circuitId=${circuitId}, scope=${scope || 'none'}, inputs=${inputs ? JSON.stringify(inputs) : 'none'}, nonce=${nonce || 'none'}, challenge=${maskHex(challenge)}, signature=${maskHex(signature)}`);
+  console.log(`[Relay] processProofRequest: requestId=${reqId}, circuitId=${circuitId}, challenge=${maskHex(challenge)}, signature=${maskHex(signature)}`);
 
-  // Verify challenge-signature
-  if (!challenge || !signature) {
-    console.log(`[Relay] processProofRequest rejected: missing auth fields — challenge=${!!challenge}, signature=${!!signature}`);
-    return { ok: false, error: 'challenge and signature are required', code: 401 };
+  // Session-based authentication: verify requestId + challenge
+  if (!reqId || !challenge) {
+    return { ok: false, error: 'requestId and challenge are required', code: 401 };
   }
 
-  const challengeResult = await verifyChallenge(challenge, signature);
-  if (!challengeResult.valid) {
-    console.log(`[Relay] processProofRequest rejected: challenge verification failed — ${challengeResult.error}`);
-    return { ok: false, error: challengeResult.error!, code: 401 };
+  const session = await getSession(reqId);
+  if (!session) {
+    console.log(`[Relay] processProofRequest rejected: session not found — requestId=${reqId}`);
+    return { ok: false, error: 'Invalid or expired session', code: 401 };
   }
 
-  const signerAddress = challengeResult.signerAddress!;
-  console.log(`[Relay] processProofRequest: challenge verified, signerAddress=${signerAddress}`);
+  if (session.status !== 'pending') {
+    console.log(`[Relay] processProofRequest rejected: session already used — requestId=${reqId}, status=${session.status}`);
+    return { ok: false, error: 'Session already used (replay detected)', code: 409 };
+  }
+
+  if (session.challenge !== challenge) {
+    console.log(`[Relay] processProofRequest rejected: challenge mismatch — requestId=${reqId}`);
+    return { ok: false, error: 'Challenge mismatch', code: 401 };
+  }
 
   // Validate required fields
   if (!circuitId || typeof circuitId !== 'string') {
@@ -265,7 +299,22 @@ async function processProofRequest(body: {
     return { ok: false, error: 'inputs object is required', code: 400 };
   }
 
-  // Replay prevention via nonce
+  // Wallet signature required for Coinbase circuits (used as circuit input)
+  if (WALLET_SIGNATURE_CIRCUITS.includes(circuitId)) {
+    if (!signature) {
+      return { ok: false, error: 'signature is required for this circuit', code: 401 };
+    }
+    const sigResult = await verifyWalletSignature(challenge, signature);
+    if (!sigResult.valid) {
+      return { ok: false, error: sigResult.error!, code: 401 };
+    }
+    console.log(`[Relay] Wallet signature verified for ${circuitId}: ${sigResult.signerAddress}`);
+  }
+
+  // Mark session as claimed (prevents replay)
+  await updateSession(reqId, { status: 'claimed', circuitId, inputs });
+
+  // Replay prevention via nonce (additional layer)
   if (nonce) {
     const seen = await cacheGet(nonceKey(nonce));
     if (seen) {
@@ -273,19 +322,17 @@ async function processProofRequest(body: {
       return { ok: false, error: 'Duplicate nonce (replay detected)', code: 409 };
     }
     await cacheSet(nonceKey(nonce), '1', NONCE_TTL);
-    console.log(`[Relay] Nonce stored: nonce=${nonce}, ttl=${NONCE_TTL}s`);
   }
 
-  const requestId = uuidv4();
+  const requestId = reqId;
   const now = new Date().toISOString();
   const effectiveScope = scope || '';
 
   const relayCallbackUrl = `${RELAY_EXTERNAL_URL || relayBaseUrl || `http://localhost:${PORT}`}/api/v1/proof/callback`;
-  console.log(`[Relay] processProofRequest: requestId=${requestId}, callbackUrl=${relayCallbackUrl}, effectiveScope=${effectiveScope}`);
+  console.log(`[Relay] processProofRequest: requestId=${requestId}, callbackUrl=${relayCallbackUrl}`);
 
   const proofRequest: ProofRequest = {
     requestId,
-    clientId: signerAddress,
     circuitId,
     scope: effectiveScope,
     inputs,
@@ -300,7 +347,6 @@ async function processProofRequest(body: {
   // Compute and store inputs hash for deep link integrity verification
   const inputsHash = computeInputsHash(inputs);
   await cacheSet(inputsHashKey(requestId), inputsHash, STATUS_TTL);
-  console.log(`[Relay] InputsHash stored: requestId=${requestId}, inputsHash=${inputsHash}, ttl=${STATUS_TTL}s`);
 
   // Set initial status
   const deepLink = buildDeepLink(proofRequest);
@@ -316,7 +362,7 @@ async function processProofRequest(body: {
 
   proofNs.to(`request:${requestId}`).emit('proof:status', { requestId, status: 'pending' });
 
-  console.log(`[Relay] Proof request created successfully: requestId=${requestId}, signerAddress=${signerAddress}, circuitId=${circuitId}, inputsHash=${inputsHash}, callbackUrl=${relayCallbackUrl}`);
+  console.log(`[Relay] Proof request created successfully: requestId=${requestId}, circuitId=${circuitId}, inputsHash=${inputsHash}`);
 
   return { ok: true, requestId, deepLink: status.deepLink!, status };
 }
@@ -326,20 +372,15 @@ async function processProofRequest(body: {
 // ---------------------------------------------------------------------------
 app.get('/api/v1/challenge', rateLimit('challenge'), async (req: Request, res: Response) => {
   try {
-    console.log(`[Relay Challenge] GET /api/v1/challenge from IP: ${req.ip}`);
+    const ip = req.ip || 'unknown';
+    console.log(`[Relay Challenge] GET /api/v1/challenge from IP: ${ip}`);
 
-    // Generate random 32-byte challenge
-    const challengeBytes = ethers.randomBytes(32);
-    const challenge = ethers.hexlify(challengeBytes);
-    const expiresAt = Date.now() + (CHALLENGE_TTL * 1000);
+    const session = await createSession(ip);
+    const expiresAt = new Date(session.expiresAt).getTime();
 
-    // Store in Redis with TTL
-    const redisValue = JSON.stringify({ createdAt: Date.now(), ip: req.ip });
-    await cacheSet(challengeKey(challenge), redisValue, CHALLENGE_TTL);
+    console.log(`[Relay Challenge] Generated: requestId=${session.requestId}, challenge=${maskHex(session.challenge)}, ip=${ip}`);
 
-    console.log(`[Relay Challenge] Generated: challenge=${maskHex(challenge)}, expiresAt=${expiresAt}, ttl=${CHALLENGE_TTL}s, ip=${req.ip}`);
-
-    res.json({ challenge, expiresAt });
+    res.json({ requestId: session.requestId, challenge: session.challenge, expiresAt });
   } catch (err: any) {
     console.error('[Relay Challenge] Generation error:', err);
     res.status(500).json({ error: 'Internal server error' });

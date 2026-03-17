@@ -1,11 +1,11 @@
 export interface ChallengeResponse {
+  requestId: string;  // session identifier
   challenge: string;  // hex-encoded 32 random bytes
   expiresAt: number;  // unix timestamp ms
 }
 
 export interface ProofRequest {
   requestId: string;
-  clientId: string;
   circuitId: string;
   scope: string;
   inputs: Record<string, unknown>;
@@ -42,4 +42,19 @@ export interface ProofStatus {
   inputsHash?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Session data stored in Redis for each proof request.
+ * Created at challenge time, updated through the request lifecycle.
+ */
+export interface ProofSession {
+  requestId: string;
+  challenge: string;
+  status: 'pending' | 'claimed' | 'completed' | 'failed' | 'expired';
+  ip: string;
+  circuitId?: string;
+  inputs?: Record<string, unknown>;
+  createdAt: string;
+  expiresAt: string;
 }
