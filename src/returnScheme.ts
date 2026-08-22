@@ -11,9 +11,25 @@
  * back), not proof-input data, so validating it here does not violate the
  * relay's "inspect the envelope, never the contents" rule.
  *
- * Accepted forms — nothing else:
- *   1. bare custom scheme   `mydapp://`             (RFC 3986 scheme + exactly "://")
- *   2. https origin         `https://host[:port]`   (no path / query / fragment / userinfo)
+ * Accepted form — exactly one:
+ *   bare custom scheme   `mydapp://`   (RFC 3986 scheme + exactly "://")
+ *
+ * An https origin used to be accepted too. It is not any more. On a real device
+ * `openURL('https://myapp.com')` opens a NEW browser tab: the page the user
+ * started from, and every bit of its JavaScript state, is abandoned. The round
+ * trip it was supposed to complete is exactly what it destroyed. A URL-shaped
+ * value also mis-taught integrators what the field is for. So the field now
+ * holds a scheme or it holds nothing:
+ *
+ *   - a NATIVE app requester passes its own registered scheme;
+ *   - a WEB requester has nothing valid to pass and omits the field. The SDK
+ *     fills in `googlechrome://` or `firefox://` for it when the page is
+ *     running in Chrome or Firefox for iOS, because opening either scheme BARE
+ *     foregrounds that browser without navigating anywhere. On Android the app
+ *     brings itself to the back instead
+ *     (`moveTaskToBack`), which resumes the browser exactly as it was, so
+ *     nothing needs to be sent at all. Everywhere else the app tells the user
+ *     the proof is delivered and lets them switch back themselves.
  *
  * Rejecting paths and query strings is the load-bearing guard: it follows
  * straight from the requirement ("which app", not "which URL") and it means a
@@ -25,20 +41,23 @@
  * trust a value that arrived inside a deep link). Keep all three in sync.
  */
 
-/** Longest accepted value. Long enough for `https://` + a max-ish hostname + port. */
+/**
+ * Longest accepted value. A registered scheme is far shorter than this in
+ * practice; the cap exists so a pathological string never reaches the regex.
+ */
 export const MAX_RETURN_SCHEME_LENGTH = 128;
 
 /** RFC 3986 scheme (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`) followed by exactly `://`. */
 const BARE_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\/$/;
 
-/** `https://host[:port]` with no userinfo, path, query or fragment. */
-const HTTPS_ORIGIN_RE =
-  /^https:\/\/[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?$/;
-
 /**
  * Schemes we refuse to hand to the OS even in the bare `scheme://` shape.
- * `http` is here because cleartext is never the right return target and
- * allowing it would blur the "this field is not a URL" line.
+ *
+ * `http` and `https` are here because a browser scheme with no host is not a
+ * return target — `https://` on its own is not even a valid URL — and because
+ * leaving them in would re-open the URL-shaped door this field just closed.
+ * Note that `googlechrome://` and `firefox://` are deliberately NOT denied:
+ * bare, they foreground that browser without navigating, which is the point.
  */
 const DENIED_SCHEMES = new Set([
   'about',
@@ -50,6 +69,7 @@ const DENIED_SCHEMES = new Set([
   'file',
   'ftp',
   'http',
+  'https',
   'intent',
   'javascript',
   'jar',
@@ -97,15 +117,11 @@ export function validateReturnScheme(value: unknown): ReturnSchemeValidation {
 
   const normalized = value.toLowerCase();
 
-  if (HTTPS_ORIGIN_RE.test(normalized)) {
-    return { valid: true, normalized };
-  }
-
   if (!BARE_SCHEME_RE.test(normalized)) {
     return {
       valid: false,
       error:
-        'returnScheme must be a bare custom scheme such as "mydapp://" or an https origin such as "https://myapp.com" — paths, query strings and fragments are not accepted',
+        'returnScheme must be a bare custom scheme such as "mydapp://" — https origins, paths, query strings and fragments are not accepted',
     };
   }
 

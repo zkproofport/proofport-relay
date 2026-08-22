@@ -153,11 +153,11 @@ describe('Relay E2E: Challenge-Signature Auth Flow', () => {
     it('rejects a reused session (one-time use)', async () => {
       const { requestId, challenge } = await getChallenge();
       const signature = await wallet.signMessage(challenge);
-      // Carries the exact value proofport-app-demo sends in production
-      // (`window.location.origin` on demo.zkproofport.app). Asserted on this
-      // request rather than in its own test because the suite has no headroom
-      // under the 10/min POST cap — see the file header.
-      const body = JSON.stringify({ requestId, circuitId: 'coinbase_attestation', inputs: { scope: '0xabc' }, challenge, signature, returnScheme: 'https://demo.zkproofport.app' });
+      // Carries the value the SDK fills in by itself when the requesting page
+      // is Chrome for iOS. Asserted on this request rather than in its own test
+      // because the suite has no headroom under the 10/min POST cap — see the
+      // file header.
+      const body = JSON.stringify({ requestId, circuitId: 'coinbase_attestation', inputs: { scope: '0xabc' }, challenge, signature, returnScheme: 'googlechrome://' });
 
       const res1 = await fetch(`${RELAY_URL}/api/v1/proof/request`, {
         method: 'POST',
@@ -166,11 +166,11 @@ describe('Relay E2E: Challenge-Signature Auth Flow', () => {
       });
       const created = await expectCreated(res1);
 
-      // The https-origin form survives the relay untouched, all the way into
-      // the base64url deep-link payload the app will parse.
+      // The scheme survives the relay untouched, all the way into the base64url
+      // deep-link payload the app will parse.
       const demoEncoded = new URL(created.deepLink).searchParams.get('data')!;
       const demoDecoded = JSON.parse(Buffer.from(demoEncoded, 'base64url').toString('utf-8'));
-      expect(demoDecoded.returnScheme).toBe('https://demo.zkproofport.app');
+      expect(demoDecoded.returnScheme).toBe('googlechrome://');
 
       // The session flips pending -> claimed on first use, so the replay is a
       // 409, not the 401 the pre-session challenge flow used to return.
@@ -186,7 +186,17 @@ describe('Relay E2E: Challenge-Signature Auth Flow', () => {
   });
 
   describe('Return scheme', () => {
-    it('rejects a URL-shaped returnScheme with 400', async () => {
+    /**
+     * The https-origin form is gone, and this is the regression that matters
+     * most: `https://demo.zkproofport.app` is the exact value the demo used to
+     * send and that opened a new browser tab on a real device. The other
+     * URL-shaped rejections (paths, queries, fragments, userinfo, host-less
+     * `https://`) are covered exhaustively in the unit suite — this one asserts
+     * over real HTTP that the validator is actually wired into the route, and
+     * it is the only shape this suite can afford: the 10/min POST cap leaves no
+     * headroom for a second case. See the file header.
+     */
+    it('rejects an https origin returnScheme with 400', async () => {
       const { requestId, challenge } = await getChallenge();
       const signature = await wallet.signMessage(challenge);
 
@@ -199,7 +209,7 @@ describe('Relay E2E: Challenge-Signature Auth Flow', () => {
           inputs: { scope: '0xabc' },
           challenge,
           signature,
-          returnScheme: 'https://evil.example.com/pay?amount=1000',
+          returnScheme: 'https://demo.zkproofport.app',
         }),
       });
 

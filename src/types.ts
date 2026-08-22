@@ -16,8 +16,11 @@ export interface ProofRequest {
   message?: string;
   /**
    * Optional app to bring back to the foreground once ZKProofport is done —
-   * a bare custom scheme (`mydapp://`) or an https origin (`https://myapp.com`).
-   * Not a URL: no path, query or fragment. Omitted means no auto-switch.
+   * a bare custom scheme (`mydapp://`). Not a URL: no host, path, query or
+   * fragment, and an https origin is NOT accepted (opening one lands the user
+   * in a new browser tab, abandoning the page that made the request). A web
+   * requester therefore has nothing valid to send and omits the field, which
+   * means no auto-switch.
    * Validated by `validateReturnScheme()` before it ever reaches a deep link.
    */
   returnScheme?: string;

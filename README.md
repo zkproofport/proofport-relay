@@ -138,19 +138,33 @@ curl -X POST http://relay:4001/api/v1/proof/request \
 **`returnScheme` (optional)** — which app the ZKProofport app should bring back
 to the foreground once it has finished. Envelope-level data: it says *which app*,
 never *which URL*, and the proof result is still delivered over the relay as
-usual. Accepted forms, nothing else:
+usual. One form is accepted, nothing else:
 
 | Form | Example |
 |------|---------|
-| bare custom scheme | `mydapp://` |
-| https origin | `https://myapp.com`, `https://myapp.com:8443` |
+| bare custom scheme | `mydapp://`, `googlechrome://`, `firefox://` |
 
 Normalised to lowercase and stored on the request, so it travels inside the
-base64url deep-link payload. Rejected with `400`: empty/whitespace values,
-anything over 128 characters, anything carrying a path, query string, fragment
-or userinfo, and the `http:`, `file:`, `data:`, `javascript:`, `intent:`,
-`tel:`, `sms:`, `mailto:` families. Omit it and the app simply stays in the
-foreground when it is done.
+base64url deep-link payload.
+
+**An https origin is NOT accepted.** `https://myapp.com` used to be a second
+accepted form and now returns `400`. Opening one returns nobody anywhere: the
+OS hands the URL to the browser, which opens a *new tab* on a freshly loaded
+page while the tab the user started in — and every bit of state in it — is left
+behind. A native app therefore sends its own registered scheme, and a web
+requester sends nothing at all. When the field is absent the ZKProofport app
+either backgrounds itself (Android, so the browser resumes untouched) or tells
+the user the proof was delivered and to switch back themselves (iOS). The two
+browser exceptions are Chrome and Firefox for iOS: the SDK fills in
+`googlechrome://` or `firefox://` by itself, because opening either scheme bare
+foregrounds that browser without navigating.
+
+Rejected with `400`: empty/whitespace values, anything over 128 characters,
+anything carrying a host, path, query string, fragment or userinfo, and the
+`http:`, `https:`, `file:`, `data:`, `javascript:`, `intent:`, `tel:`, `sms:`,
+`mailto:` families. Note `https:` and `http:` are denied as schemes too — with
+no host they are shaped exactly like a bare custom scheme, so the shape rule
+alone would let `https://` through.
 
 **Response (201):**
 ```json

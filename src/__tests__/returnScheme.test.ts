@@ -128,19 +128,64 @@ describe('returnScheme — shape (matrix row 7)', () => {
     expect(validateReturnScheme(value).valid).toBe(false);
   });
 
-  it('accepts a bare https origin', () => {
-    expect(validateReturnScheme('https://myapp.com')).toEqual({
+});
+
+// --- The https origin form, removed ------------------------------------------
+/**
+ * A bare https origin used to be accepted as a second form. It is not any more.
+ *
+ * Opening one does not return the user to the page that made the request: the
+ * OS hands the URL to the browser, which opens a NEW tab on a freshly loaded
+ * page, while the tab the user actually started from keeps its state and stays
+ * in the background. The round trip the field exists to complete is exactly
+ * what an https origin destroyed. The field brings an APP forward, so it now
+ * takes a scheme or it takes nothing.
+ *
+ * These assertions are the regression guard. Reintroduce an origin branch and
+ * every case here fails.
+ */
+describe('returnScheme — the https origin form is gone', () => {
+  const rejected = [
+    'https://myapp.com',              // the plain form that used to pass
+    'https://myapp.com:8443',         // ...and with a port
+    'https://demo.zkproofport.app',   // the exact value the demo used to send
+    'https://stg-demo.zkproofport.app',
+    'https://a.b.c.example.com',
+    'HTTPS://MyApp.COM',              // case-insensitively too
+    'https://localhost',              // never matched the origin shape anyway
+  ];
+
+  it.each(rejected)('rejects the https origin %s', (value) => {
+    const r = validateReturnScheme(value);
+    expect(r.valid).toBe(false);
+    expect(r.normalized).toBeUndefined();
+  });
+
+  it('explains the scheme-only rule when handed a URL-shaped value', () => {
+    expect(validateReturnScheme('https://myapp.com').error).toMatch(/bare custom scheme/);
+  });
+
+  /**
+   * The back door the shape rule alone leaves open: `https://` and `http://`
+   * have no host, so they are shaped exactly like a bare custom scheme and
+   * sail through BARE_SCHEME_RE. Only the denied list stops them. A browser
+   * pointed at nowhere is not a return target, and allowing it would re-open
+   * the URL-shaped door this change just closed.
+   */
+  it.each(['https://', 'http://', 'HTTPS://', 'HtTp://'])(
+    'rejects the host-less browser scheme %s as denied, not as valid',
+    (value) => {
+      const r = validateReturnScheme(value);
+      expect(r.valid).toBe(false);
+      expect(r.error).toMatch(/not allowed/);
+    },
+  );
+
+  it('still accepts the scheme form the field is actually for', () => {
+    expect(validateReturnScheme('mydapp://')).toEqual({
       valid: true,
-      normalized: 'https://myapp.com',
+      normalized: 'mydapp://',
     });
-  });
-
-  it('accepts an https origin with a port', () => {
-    expect(validateReturnScheme('https://myapp.com:8443').valid).toBe(true);
-  });
-
-  it('rejects an https origin with no dot (not a public host shape)', () => {
-    expect(validateReturnScheme('https://localhost').valid).toBe(false);
   });
 });
 
@@ -201,7 +246,7 @@ describe('returnScheme — junk (matrix row 19)', () => {
 describe('returnScheme — normalization and deep-link round trip (matrix row 17)', () => {
   it('lowercases the accepted value', () => {
     expect(validateReturnScheme('MyDapp://').normalized).toBe('mydapp://');
-    expect(validateReturnScheme('HTTPS://MyApp.COM').normalized).toBe('https://myapp.com');
+    expect(validateReturnScheme('My-Dapp.V2+Alpha://').normalized).toBe('my-dapp.v2+alpha://');
   });
 
   it('survives the base64url deep-link encoding unchanged', () => {
@@ -235,29 +280,38 @@ describe('returnScheme — normalization and deep-link round trip (matrix row 17
   });
 });
 
-// --- Chain: the values proofport-app-demo can actually produce ---------------
+// --- Chain: the values a requester can actually produce ---------------------
 /**
- * The demo derives its return target from `window.location.origin`
- * (`proofport-app-demo/lib/returnScheme.ts`), so the exact strings it can emit
- * are fixed by the environments it is deployed to. They are asserted against
- * the authority here so a tightening of the validator cannot silently turn the
- * demo's requests into 400s. The counterpart assertions — that the demo really
- * produces these strings and nothing else — live in
- * `proofport-app-demo/__tests__/returnScheme.test.ts`.
+ * The demo used to derive an https origin from `window.location.origin` and
+ * send it here. That is gone: `proofport-app-demo/lib/returnScheme.ts` was
+ * deleted along with the https form, because a web page has no app to hand
+ * control back to and the origin it could name was the wrong answer anyway.
+ *
+ * What can reach this validator now:
+ *   - a native integrator's own registered scheme;
+ *   - `googlechrome://`, which the SDK fills in by itself when the requesting
+ *     page is running in Chrome for iOS (`CriOS` in the user agent). Bare, that
+ *     scheme foregrounds Chrome WITHOUT navigating, so the user lands back on
+ *     the tab they were already reading.
+ * Everything else sends nothing at all.
+ *
+ * These are asserted against the authority so a tightening of the validator
+ * cannot silently turn a live request into a 400.
  */
-describe('returnScheme — proofport-app-demo origins', () => {
+describe('returnScheme — the values a requester can actually produce', () => {
   const accepted = [
-    'https://demo.zkproofport.app',        // production
-    'https://stg-demo.zkproofport.app',    // staging
+    'googlechrome://',   // what the SDK sends for Chrome on iOS
+    'mydapp://',         // a native integrator's own scheme
+    'zkproofport://',    // our own, i.e. an app calling us back
   ];
 
-  it.each(accepted)('accepts the demo origin %s unchanged', (origin) => {
-    const r = validateReturnScheme(origin);
+  it.each(accepted)('accepts %s unchanged', (value) => {
+    const r = validateReturnScheme(value);
     expect(r.valid).toBe(true);
-    expect(r.normalized).toBe(origin);
+    expect(r.normalized).toBe(value);
   });
 
-  it('carries the production origin through the deep-link encoding', () => {
+  it('carries googlechrome:// through the deep-link encoding', () => {
     // Mirrors buildDeepLink() in src/index.ts.
     const request = {
       requestId: 'req-demo-1',
@@ -266,19 +320,24 @@ describe('returnScheme — proofport-app-demo origins', () => {
       inputs: { scope: 'zkproofport:demo' },
       callbackUrl: 'https://relay.zkproofport.app/api/v1/proof/callback',
       dappName: 'ZKProofport Demo',
-      returnScheme: validateReturnScheme('https://demo.zkproofport.app').normalized,
+      returnScheme: validateReturnScheme('googlechrome://').normalized,
       createdAt: new Date().toISOString(),
     };
     const data = Buffer.from(JSON.stringify(request)).toString('base64url');
     const decoded = JSON.parse(
       Buffer.from(new URL(`zkproofport://proof-request?data=${data}`).searchParams.get('data')!, 'base64url').toString('utf-8'),
     );
-    expect(decoded.returnScheme).toBe('https://demo.zkproofport.app');
+    expect(decoded.returnScheme).toBe('googlechrome://');
   });
 
-  it('rejects the local dev origins, which is why the demo omits the field there', () => {
-    // http is denied outright, and `localhost` has no dot even over https.
-    for (const origin of ['http://localhost:3300', 'http://192.168.0.10:3300', 'https://localhost:3300']) {
+  it('rejects every origin the demo used to send, local and deployed alike', () => {
+    for (const origin of [
+      'https://demo.zkproofport.app',
+      'https://stg-demo.zkproofport.app',
+      'http://localhost:3300',
+      'http://192.168.0.10:3300',
+      'https://localhost:3300',
+    ]) {
       expect(validateReturnScheme(origin).valid).toBe(false);
     }
   });
