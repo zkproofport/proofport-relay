@@ -8,6 +8,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { createHash } from 'crypto';
 import { initRedis, cacheSet, cacheGet } from './redis';
 import type { ProofRequest, ProofResult, ProofStatus, ProofSession } from './types';
+import { validateReturnScheme } from './returnScheme';
 import { ethers } from 'ethers';
 
 dotenv.config();
@@ -265,6 +266,7 @@ async function processProofRequest(body: {
   dappName?: string;
   dappIcon?: string;
   message?: string;
+  returnScheme?: string;
 }, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
   const { requestId: reqId, circuitId, scope, inputs, nonce, challenge, signature } = body;
 
@@ -297,6 +299,19 @@ async function processProofRequest(body: {
   }
   if (!inputs || typeof inputs !== 'object') {
     return { ok: false, error: 'inputs object is required', code: 400 };
+  }
+
+  // Envelope-level: where control goes back to when the app is done. A bad
+  // value is rejected here rather than silently dropped so the integrator gets
+  // a 400 instead of a feature that quietly never fires.
+  let returnScheme: string | undefined;
+  if (body.returnScheme !== undefined && body.returnScheme !== null) {
+    const returnSchemeCheck = validateReturnScheme(body.returnScheme);
+    if (!returnSchemeCheck.valid) {
+      console.log(`[Relay] processProofRequest rejected: invalid returnScheme — requestId=${reqId}, value=${String(body.returnScheme)}, error=${returnSchemeCheck.error}`);
+      return { ok: false, error: returnSchemeCheck.error!, code: 400 };
+    }
+    returnScheme = returnSchemeCheck.normalized;
   }
 
   // Wallet signature required for Coinbase circuits (used as circuit input)
@@ -340,6 +355,7 @@ async function processProofRequest(body: {
     ...(body.dappName && { dappName: body.dappName }),
     ...(body.dappIcon && { dappIcon: body.dappIcon }),
     ...(body.message && { message: body.message }),
+    ...(returnScheme && { returnScheme }),
     createdAt: now,
   };
   console.log(`[Relay] ProofRequest object: ${safeStringify(proofRequest as unknown as Record<string, unknown>)}`);
@@ -568,6 +584,7 @@ proofNs.on('connection', (socket: Socket) => {
     nonce?: string;
     challenge?: string;
     signature?: string;
+    returnScheme?: string;
   }) => {
     console.log(`[Socket.IO] proof:request from ${socket.id}: ${safeStringify(data as unknown as Record<string, unknown>)}`);
     try {

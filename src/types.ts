@@ -14,6 +14,13 @@ export interface ProofRequest {
   dappName?: string;
   dappIcon?: string;
   message?: string;
+  /**
+   * Optional app to bring back to the foreground once ZKProofport is done —
+   * a bare custom scheme (`mydapp://`) or an https origin (`https://myapp.com`).
+   * Not a URL: no path, query or fragment. Omitted means no auto-switch.
+   * Validated by `validateReturnScheme()` before it ever reaches a deep link.
+   */
+  returnScheme?: string;
   createdAt: string;
 }
 

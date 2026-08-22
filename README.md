@@ -130,9 +130,27 @@ curl -X POST http://relay:4001/api/v1/proof/request \
     },
     "nonce": "unique_idempotency_key",
     "challenge": "0xa1b2c3d4e5f6...",
-    "signature": "0xdeadbeef..."
+    "signature": "0xdeadbeef...",
+    "returnScheme": "mydapp://"
   }'
 ```
+
+**`returnScheme` (optional)** — which app the ZKProofport app should bring back
+to the foreground once it has finished. Envelope-level data: it says *which app*,
+never *which URL*, and the proof result is still delivered over the relay as
+usual. Accepted forms, nothing else:
+
+| Form | Example |
+|------|---------|
+| bare custom scheme | `mydapp://` |
+| https origin | `https://myapp.com`, `https://myapp.com:8443` |
+
+Normalised to lowercase and stored on the request, so it travels inside the
+base64url deep-link payload. Rejected with `400`: empty/whitespace values,
+anything over 128 characters, anything carrying a path, query string, fragment
+or userinfo, and the `http:`, `file:`, `data:`, `javascript:`, `intent:`,
+`tel:`, `sms:`, `mailto:` families. Omit it and the app simply stays in the
+foreground when it is done.
 
 **Response (201):**
 ```json
@@ -146,7 +164,7 @@ curl -X POST http://relay:4001/api/v1/proof/request \
 
 **Status Codes:**
 - `201`: Request created successfully
-- `400`: Missing required fields or invalid inputs
+- `400`: Missing required fields, invalid inputs, or malformed `returnScheme`
 - `401`: Missing or invalid challenge/signature
 - `409`: Duplicate nonce (replay detected)
 - `429`: Rate limit exceeded
