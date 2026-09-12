@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { CIRCUIT_NEEDS_WALLET_SIGNATURE } from '@zkproofport-app/sdk/circuits';
-import { SIGNATURE_POLICY } from '../index';
+// From the policy module, not the server entry. Importing the entry boots the
+// relay, which demands REDIS_URL and refuses to load -- so this file failed for
+// a reason that had nothing to do with what it checks.
+import { SIGNATURE_POLICY } from '../signaturePolicy';
 
 /**
  * The relay decides for itself whether a circuit needs a wallet signature, and
