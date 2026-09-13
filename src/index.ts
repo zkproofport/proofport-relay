@@ -197,6 +197,10 @@ async function verifyWalletSignature(challenge: string, signature: string): Prom
 // ---------------------------------------------------------------------------
 // Inputs hash
 // ---------------------------------------------------------------------------
+// Known limitation: the replacer filters nested keys (e.g. arc_eligibility.action).
+// Use recursive stable canonicalization before treating this hash as tamper-evident
+// integrity protection for nested requests; it is not Arc's exact-action
+// authorization boundary.
 function computeInputsHash(inputs: Record<string, unknown>): string {
   const sortedKeys = Object.keys(inputs).sort();
   const canonical = JSON.stringify(inputs, sortedKeys);
@@ -508,6 +512,10 @@ app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 // REST: POST /api/v1/proof/callback  (ZKProofport app posts result here)
 // ---------------------------------------------------------------------------
+// Callback writes currently rely on possession of a live requestId.
+// Status/results are transport state, not authorization. Production hardening
+// requires per-session capability/signature authentication (or equivalent);
+// consumers must cryptographically verify the ZK proof and expected public inputs.
 app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
   console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${req.ip}, body=${safeStringify(req.body || {})}`);
   try {
