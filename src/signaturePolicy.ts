@@ -19,9 +19,6 @@ import type { CircuitId } from '@zkproofport-app/sdk/circuits';
 export const SIGNATURE_POLICY = {
   coinbase_attestation: true,
   coinbase_country_attestation: true,
-  // Same Coinbase-attested wallet; the signature is over an EIP-712 action
-  // instead of signal_hash, which changes nothing the relay can see.
-  arc_eligibility: true,
   // The signature is inside the OIDC identity token, checked by the prover.
   oidc_domain_attestation: false,
   // Web2 (OmniOne CX) flows with no wallet binding at all.
@@ -35,10 +32,9 @@ export const SIGNATURE_POLICY = {
   giwa_attestation: true,
   // `satisfies` and not an annotation: an annotation on the const would be
   // checked THROUGH Object.freeze(), which is a generic call and so swallows
-  // excess-property checking. That version compiled cleanly against an SDK
-  // with no `arc_eligibility` at all -- a guard that looked like it bit and
-  // did not. `satisfies` checks both directions on the literal: a circuit the
-  // SDK added and nobody classified, and a key naming a circuit the installed
+  // excess-property checking. That version compiled cleanly with a key the
+  // SDK had never defined -- a guard that looked like it bit and did not.
+  // `satisfies` checks both directions on the literal: a circuit the SDK added and nobody classified, and a key naming a circuit the installed
   // SDK has never heard of.
 } satisfies Record<CircuitId, boolean>;
 

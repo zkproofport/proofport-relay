@@ -197,10 +197,10 @@ async function verifyWalletSignature(challenge: string, signature: string): Prom
 // ---------------------------------------------------------------------------
 // Inputs hash
 // ---------------------------------------------------------------------------
-// Known limitation: the replacer filters nested keys (e.g. arc_eligibility.action).
+// Known limitation: the replacer filters nested keys (e.g. giwa_attestation.action).
 // Use recursive stable canonicalization before treating this hash as tamper-evident
-// integrity protection for nested requests; it is not Arc's exact-action
-// authorization boundary.
+// integrity protection for nested requests; it is not an action-bound circuit's
+// exact-action authorization boundary -- the proof is.
 function computeInputsHash(inputs: Record<string, unknown>): string {
   const sortedKeys = Object.keys(inputs).sort();
   const canonical = JSON.stringify(inputs, sortedKeys);

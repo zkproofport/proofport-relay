@@ -15,8 +15,8 @@ import { SIGNATURE_POLICY } from '../signaturePolicy';
  * The SDK's copy exists so a dapp gets "Signer not set" locally instead of a
  * relay 401 two round trips later.
  *
- * Before this existed, both were typed-out arrays and the SDK's had missed
- * `arc_eligibility` while the relay's had it. Nothing noticed.
+ * Before this existed, both were typed-out arrays and the SDK's had missed a
+ * circuit the relay's had. Nothing noticed.
  */
 describe('the relay and the SDK agree on which circuits need a signature', () => {
   it('names the same circuits', () => {
