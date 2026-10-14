@@ -27,24 +27,51 @@ export interface ProofRequest {
   createdAt: string;
 }
 
+/**
+ * The states a request can end in. Once one is reached it never changes.
+ *
+ * `completed`, `error`, `cancelled` come from the app; `failed` is the older
+ * name for `error`, still accepted from apps that send it. `expired` is
+ * written by the relay itself when the app has not answered by the deadline.
+ */
+export const TERMINAL_STATUSES = ['completed', 'error', 'failed', 'cancelled', 'expired'] as const;
+export type TerminalStatus = typeof TERMINAL_STATUSES[number];
+
+/** Terminal statuses the APP may send. `expired` belongs to the relay. */
+export const APP_TERMINAL_STATUSES = ['completed', 'error', 'failed', 'cancelled'] as const;
+
+/** Non-terminal statuses the app may report while it works. */
+export const INTERMEDIATE_STATUSES = ['generating'] as const;
+
 export interface ProofResult {
   requestId: string;
-  status: 'completed' | 'failed' | 'error';
+  status: TerminalStatus;
   proof?: string;
   publicInputs?: string[];
   error?: string;
+  /** The app's ErrorModal code (`E2007`), when the app sent one. */
+  errorCode?: string;
   verifierAddress?: string;
   chainId?: number;
   circuit?: string;
   completedAt: string;
 }
 
+/** What the relay remembers about a request for itself; never sent to anyone. */
+export interface RequestMeta {
+  /** The circuit as validated at creation. Stats use this, not the callback's claim. */
+  circuitId: string;
+  /** Unix ms after which the relay answers the dApp with `expired`. */
+  deadlineAt: number;
+}
+
 export interface ProofStatus {
   requestId: string;
-  status: 'pending' | 'generating' | 'completed' | 'failed' | 'error' | 'expired';
+  status: 'pending' | typeof INTERMEDIATE_STATUSES[number] | TerminalStatus;
   proof?: string;
   publicInputs?: string[];
   error?: string;
+  errorCode?: string;
   verifierAddress?: string;
   chainId?: number;
   circuit?: string;

@@ -66,6 +66,14 @@ npm start
 
 Compiled output is in `dist/`.
 
+### Tests
+
+```bash
+./scripts/test-relay.sh unit          # from the repo root; no services
+./scripts/test-relay.sh integration   # in-process relays on the dev Redis, DB 15 (flushed)
+./scripts/test-relay.sh e2e           # relay :4001 + test-only relay-b :4011 on one Redis
+```
+
 ### Type Checking
 
 ```bash
@@ -82,6 +90,7 @@ Environment variables (see `.env.example`):
 | `CORS_ORIGIN` | `*` | CORS allowed origins |
 | `REDIS_URL` | (required) | Redis connection string |
 | `RELAY_EXTERNAL_URL` | (required for production) | External relay URL for deep link callbacks |
+| `RELAY_STATS_TOKEN` | (required, ≥ 32 chars) | Bearer token for `GET /api/v1/stats`. The relay refuses to start without it. Locally `scripts/dev.sh` generates one into `.env.development`; deployed environments read the Google Secret Manager secrets `relay-stats-token-staging` / `relay-stats-token-production` (mounted by `deploy.yml` with `--set-secrets`; GitHub secrets are write-only, so the token could never be read back to call the API) |
 | `NODE_ENV` | `development` | Environment mode |
 
 ## API Reference
@@ -213,6 +222,10 @@ After completion:
 }
 ```
 
+`status` is `pending`, `generating`, or a terminal status: `completed`, `error`, `failed` (older apps' name for `error`), `cancelled`, `expired`. A terminal response carries the buffered result (`proof`, `publicInputs`, `error`, `errorCode`, `verifierAddress`, `chainId`, `circuit`) while it is kept (5 minutes).
+
+A poll of a request past its deadline expires it on the spot (see [Request deadline](#request-deadline)).
+
 **Status Codes:**
 - `200`: Status retrieved
 - `404`: Request not found or expired (TTL: 10 minutes)
@@ -243,10 +256,23 @@ Receive proof completion callback from mobile app.
 ```json
 {
   "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "failed",
-  "error": "Invalid inputs"
+  "circuit": "coinbase_attestation",
+  "status": "error",
+  "errorCode": "E2007",
+  "error": "Proof generation failed"
 }
 ```
+
+**Request (Final Status - Declined by the user):**
+```json
+{ "requestId": "550e8400-e29b-41d4-a716-446655440000", "circuit": "coinbase_attestation", "status": "cancelled" }
+```
+
+| Field | Rule |
+|-------|------|
+| `status` | `completed`, `error`, `cancelled` (terminal); `failed` is accepted as the older name for `error`; `generating` is the one intermediate status. Anything else, including `expired` (which only the relay writes), is 400 |
+| `errorCode` | Optional, `^E\d{4}$` (the app's ErrorModal codes). Malformed or non-string is 400. Stored and counted only on `error`/`failed` |
+| `error` | Optional string forwarded to the dApp. Cut to 1000 characters (code points). Never used as a statistics key. Non-string is 400 |
 
 **Response:**
 ```json
@@ -257,14 +283,51 @@ Receive proof completion callback from mobile app.
 
 **Status Codes:**
 - `200`: Callback received
-- `400`: Missing requestId or status
+- `400`: Missing/invalid requestId or status, malformed errorCode, non-string error, malformed JSON
 - `404`: Unknown or expired requestId
+- `409`: The request already has a terminal status. Nothing changes: no second result, no second emit, no second count. Body is stable: `reason: "expired"` after a relay timeout, `reason: "already_answered"` otherwise. The terminal record is kept 7 days, so an answer the app re-sends on a later launch gets this 409 rather than 404
 - `500`: Internal server error
 
 **Behavior:**
-- Intermediate statuses (`generating`, `verifying`) update status only
-- Final statuses (`completed`, `failed`) store result and broadcast via Socket.IO
+- The intermediate status (`generating`) updates status only, and never overwrites a terminal one
+- A terminal status is taken exactly once (an atomic Redis script decides the winner): the result is buffered, the status set, `proof:result` emitted to every instance's sockets, and the outcome counted
 - Result buffered in Redis for 5 minutes (client reconnection tolerance)
+- Statistics use the circuit recorded when the request was created, not the `circuit` the callback claims
+
+#### GET /api/v1/stats
+Per-circuit request statistics, per UTC day. `Authorization: Bearer <RELAY_STATS_TOKEN>` is required (401 otherwise, checked before anything else).
+
+`GET /api/v1/stats?from=2026-10-01&to=2026-10-14` — both required, `YYYY-MM-DD` (UTC), real calendar dates, `from <= to`, at most 400 days inclusive (400 otherwise).
+
+```json
+{
+  "from": "2026-10-01",
+  "to": "2026-10-14",
+  "days": [
+    { "date": "2026-10-01", "circuits": {
+      "coinbase_attestation": {
+        "requested": 12, "completed": 9,
+        "error": { "total": 1, "byCode": { "E2007": 1 } },
+        "cancelled": 1, "expired": 1, "abandoned": 2
+      } } }
+  ],
+  "totals": { "circuits": { "coinbase_attestation": { "...": "same shape" } }, "all": { "...": "same shape" } },
+  "unrecognized": {}
+}
+```
+
+- Only dApp → relay requests are counted (app-internal proofs never reach the relay).
+- `abandoned` = `cancelled` + `expired`: the user never answered.
+- `error.byCode.none` counts errors that arrived without an `errorCode`.
+- An event counts on the UTC day it happened: a request at 23:59 that expires at 00:03 is `requested` on one day and `expired` on the next.
+- Stored as Redis hashes `relay:stats:YYYY-MM-DD` (fields `<circuit>|requested`, `<circuit>|completed`, `<circuit>|error|<code or none>`, `<circuit>|cancelled`, `<circuit>|expired`), 400-day TTL. No IP, wallet, requestId, scope or nullifier is stored.
+- Counting is fire-and-forget: a Redis error while counting is logged and dropped, never failing or delaying the proof path.
+
+#### Request deadline
+
+The relay answers the dApp itself when the app has not answered within **280 s** (`REQUEST_DEADLINE_MS` in `src/app.ts`), 20 s before the SDK's default 300 s wait gives up. The result is `{ "status": "expired", "error": "The request timed out before the app answered" }`, delivered over `proof:result` and polling like any other terminal status, and counted as `expired`. A late app callback gets 409 `{ "error": "The request timed out before the app answered", "reason": "expired" }`.
+
+Deadlines live in the Redis sorted set `proof:deadlines`, not in process memory: every instance sweeps it every 5 s, the atomic terminal script lets exactly one instance win each expiry, and a poll, subscribe or callback that touches an overdue request expires it on the spot.
 
 #### GET /health
 Health check endpoint.
@@ -354,7 +417,9 @@ socket.on('proof:error', (data) => {
 Real-time status update for active request.
 
 #### Event: proof:result (Server -> Client)
-Final proof result broadcast.
+Terminal result broadcast, sent exactly once per request (and replayed to a late `proof:subscribe`): `status` is `completed`, `error`, `failed`, `cancelled` or `expired`.
+
+Socket.IO uses the Redis adapter (`@socket.io/redis-adapter`) on the same Redis, so an emit from the instance that received the app's callback reaches a dApp socket connected to any other instance. Polling transport still needs sticky sessions (`--session-affinity` on Cloud Run); the SDK connects with WebSocket first.
 
 ## Rate Limiting
 
@@ -379,7 +444,11 @@ All session data cached in Redis with TTL:
 | `proof:result:{requestId}` | 5 min | Proof result (for reconnection) |
 | `proof:nonce:{nonce}` | 10 min | Nonce seen flag (replay prevention) |
 | `proof:inputsHash:{requestId}` | 10 min | SHA256 hash of proof inputs |
-| `challenge:{challenge}` | 2 min | Challenge for signature auth |
+| `session:{requestId}` | 10 min | Challenge session |
+| `proof:meta:{requestId}` | 10 min | Circuit as requested and the deadline (relay-internal) |
+| `proof:terminal:{requestId}` | 10 min | The terminal status taken; makes the terminal transition one-way |
+| `proof:deadlines` | — | Sorted set of open requests by deadline (ms) |
+| `relay:stats:{YYYY-MM-DD}` | 400 days | Per-circuit counters (see `GET /api/v1/stats`) |
 
 ## Deep Link Format
 
@@ -521,6 +590,8 @@ curl http://0.0.0.0:4001/api/v1/proof/{requestId}
 
 Development logs to stdout. Production should use structured logging (JSON).
 
+**Personal data is masked in every log line** by `src/mask.ts`: IPs (`203.0.x.x`, IPv6 first three groups), addresses, hashes and nullifiers (`0x1234…abcd`), e-mail local parts; request and callback bodies are logged as key names plus envelope fields only (`requestId`, `circuit`, `status`, `errorCode`, `dappName`, `chainId`, `verifierAddress`, `returnScheme`); deep links without their payload; free-text errors through the scrubber. Rate limiting still uses the real IP in memory. Masking is not truncation — non-personal values are logged in full.
+
 **Log Prefixes:**
 - `[Relay]` - Core request handling
 - `[REST]` - HTTP endpoint errors
@@ -584,10 +655,11 @@ interface ProofRequest {
 
 interface ProofStatus {
   requestId: string;
-  status: 'pending' | 'generating' | 'completed' | 'failed' | 'error' | 'expired';
+  status: 'pending' | 'generating' | 'completed' | 'failed' | 'error' | 'cancelled' | 'expired';
   proof?: string;
   publicInputs?: string[];
   error?: string;
+  errorCode?: string;
   deepLink?: string;
   inputsHash?: string;
   createdAt: string;
@@ -596,10 +668,11 @@ interface ProofStatus {
 
 interface ProofResult {
   requestId: string;
-  status: 'completed' | 'failed' | 'error';
+  status: 'completed' | 'failed' | 'error' | 'cancelled' | 'expired';
   proof?: string;
   publicInputs?: string[];
   error?: string;
+  errorCode?: string;
   completedAt: string;
 }
 ```
@@ -617,6 +690,10 @@ interface ProofResult {
 | Missing inputs | 400 | `inputs object is required` |
 | Replay detected | 409 | `Duplicate nonce (replay detected)` |
 | Request expired | 404 | `Request not found or expired` |
+| Second terminal callback | 409 | `{ "error": "This request has already been answered", "reason": "already_answered" }` |
+| Callback after the relay timed the request out | 409 | `{ "error": "The request timed out before the app answered", "reason": "expired" }` |
+| Malformed `errorCode` | 400 | `errorCode must look like E2007 (E followed by four digits)` |
+| Stats without / with wrong token | 401 | `Unauthorized` |
 | Rate limit exceeded | 429 | `Too many requests. Please try again later.` |
 
 ## Performance
