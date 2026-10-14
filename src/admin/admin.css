@@ -1,0 +1,108 @@
+:root {
+  color-scheme: light;
+  --surface-0: #f4f4f2;
+  --surface-1: #fcfcfb;
+  --border: #dcdbd6;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --accent: #2a78d6;
+  --danger: #c23434;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --grid: #e6e5e0;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --border: #383835;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --accent: #3987e5;
+    --danger: #e66767;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --grid: #2b2b29;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-0: #121211;
+  --surface-1: #1a1a19;
+  --border: #383835;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --accent: #3987e5;
+  --danger: #e66767;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --grid: #2b2b29;
+}
+
+[hidden] { display: none !important; }
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", sans-serif;
+}
+main { max-width: 1080px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 20px; margin: 0 0 16px; }
+h2 { font-size: 15px; margin: 0 0 12px; }
+button, input, select {
+  font: inherit;
+  color: inherit;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+#login-view { max-width: 420px; margin: 10vh auto 0; }
+#login-form { display: grid; gap: 8px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+#login-button { background: var(--accent); border-color: var(--accent); color: #fff; }
+.hint, .muted { color: var(--text-secondary); }
+.small { font-size: 12px; }
+.error { color: var(--danger); margin: 4px 0; }
+
+.topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.topbar h1 { margin: 0; }
+.controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 16px 0 8px; }
+.presets { display: flex; gap: 6px; }
+.preset[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.range { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.range label, .circuit-filter { display: flex; gap: 6px; align-items: center; color: var(--text-secondary); }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin: 12px 0; }
+.tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; display: grid; }
+.tile-label { color: var(--text-secondary); font-size: 12px; }
+.tile-value { font-size: 22px; font-variant-numeric: tabular-nums; }
+
+.panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin: 12px 0; }
+.empty { background: var(--surface-1); border: 1px dashed var(--border); border-radius: 8px; padding: 32px; text-align: center; color: var(--text-secondary); }
+
+.legend { list-style: none; display: flex; gap: 16px; padding: 0; margin: 0 0 8px; color: var(--text-secondary); }
+.legend li { display: flex; align-items: center; gap: 6px; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.swatch-requested { background: var(--series-1); }
+.swatch-completed { background: var(--series-2); }
+
+.chart svg { width: 100%; height: auto; display: block; }
+.chart .grid { stroke: var(--grid); stroke-width: 1; }
+.chart .axis-label { fill: var(--text-secondary); font-size: 11px; }
+.chart .bar-requested { fill: var(--series-1); }
+.chart .bar-completed { fill: var(--series-2); }
+.chart rect:hover { opacity: 0.8; }
+
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+#error-table td:nth-child(2), #error-table td:nth-child(3), #error-table th:nth-child(2), #error-table th:nth-child(3) { text-align: left; }
+thead th { color: var(--text-secondary); font-weight: 600; }

@@ -15,6 +15,9 @@ import { NEEDS_WALLET_SIGNATURE } from './signaturePolicy';
 import { Lifecycle, STATUS_TTL_SECONDS } from './lifecycle';
 import { describeBody, describeDeepLink, maskHex, maskIp, scrubError, scrubText } from './mask';
 import { bearerMatches, checkRange, ERROR_CODE_RE, readStats, StatsRecorder, TerminalOutcome } from './stats';
+import { clientIp, TRUSTED_PROXY_HOPS } from './clientIp';
+import { createStatsAuthGuard, STATS_AUTH_MAX_FAILURES, StatsAuthGuard } from './statsAuth';
+import { mountAdmin } from './admin';
 
 /**
  * How long the relay waits for the app before it answers the dApp itself.
@@ -53,8 +56,20 @@ const SESSION_KEY_PREFIX = 'session:';
 
 const RATE_LIMITS = {
   challenge: { windowMs: 60_000, max: 30 },
+  /** Shared by POST /api/v1/proof/request and the Socket.IO `proof:request` event. */
   request: { windowMs: 60_000, max: 10 },
+  /** Authenticated stats reads. Wrong tokens are limited separately (statsAuth.ts). */
+  stats: { windowMs: 60_000, max: 60 },
 };
+
+/**
+ * Paths no other origin may call from a browser: the admin page and the
+ * stats API it reads. They get no CORS headers at all, whatever CORS_ORIGIN
+ * says, so a cross-origin `fetch` -- with or without the token -- is blocked
+ * by the browser, and a preflight for the Authorization header is refused.
+ * The page itself is same-origin and needs no CORS.
+ */
+const SAME_ORIGIN_ONLY = [/^\/api\/v1\/stats(\/|$)/i, /^\/admin(\/|$)/i];
 
 export interface RelayOptions {
   /** Request state: sessions, statuses, results, deadlines. */
@@ -62,6 +77,8 @@ export interface RelayOptions {
   stats: StatsRecorder;
   /** Bearer token for GET /api/v1/stats. */
   statsToken: string;
+  /** Wrong-token lockout for the stats API. Defaults to one on `redis`. */
+  statsAuth?: StatsAuthGuard;
   /** Socket.IO adapter. The Redis adapter in every deployment; null only for a single in-process test instance. */
   adapter: ServerOptions['adapter'] | null;
   corsOrigin: string | string[];
@@ -103,13 +120,23 @@ function capErrorMessage(message: string): string {
 export function createRelay(options: RelayOptions): Relay {
   const { redis, stats, statsToken } = options;
   if (!statsToken) throw new Error('statsToken is required');
+  const statsAuth = options.statsAuth ?? createStatsAuthGuard(redis);
   const lifecycle = new Lifecycle(redis, options.deadlineMs);
 
   const app = express();
   const httpServer = createServer(app);
 
+  // See clientIp.ts: exactly one hop (Google's front end), never `true`.
+  // Set so `req.ip` and `req.protocol` agree with clientIp(); the relay's own
+  // code reads clientIp() so HTTP and Socket.IO share one definition.
+  app.set('trust proxy', TRUSTED_PROXY_HOPS);
+
   app.use(helmet());
-  app.use(cors({ origin: options.corsOrigin }));
+  const corsMiddleware = cors({ origin: options.corsOrigin });
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (SAME_ORIGIN_ONLY.some((re) => re.test(req.path))) return next();
+    corsMiddleware(req, res, next);
+  });
   app.use(express.json({ limit: '1mb' }));
 
   const io = new Server(httpServer, {
@@ -121,29 +148,36 @@ export function createRelay(options: RelayOptions): Relay {
   const room = (requestId: string) => `request:${requestId}`;
 
   // -------------------------------------------------------------------------
-  // Rate limiting (in-memory sliding window). Keyed by the real IP; only the
-  // log line is masked.
+  // Rate limiting (in-memory fixed window, per instance). Keyed by the
+  // caller's address from clientIp() -- the same for HTTP and Socket.IO; only
+  // the log line is masked.
   // -------------------------------------------------------------------------
   const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
 
+  /** Counts one hit. Null when allowed; otherwise seconds until the window resets. */
+  function consume(type: keyof typeof RATE_LIMITS, ip: string): number | null {
+    const key = `${type}:${ip}`;
+    const limit = RATE_LIMITS[type];
+    const now = Date.now();
+    const entry = rateLimitStore.get(key);
+    if (!entry || now > entry.resetAt) {
+      rateLimitStore.set(key, { count: 1, resetAt: now + limit.windowMs });
+      return null;
+    }
+    if (entry.count >= limit.max) {
+      console.log(`[Relay RateLimit] Rejected: type=${type}, ip=${maskIp(ip)}, count=${entry.count}, max=${limit.max}, resetsAt=${new Date(entry.resetAt).toISOString()}`);
+      return Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+    }
+    entry.count++;
+    return null;
+  }
+
   function rateLimit(type: keyof typeof RATE_LIMITS) {
     return (req: Request, res: Response, next: NextFunction) => {
-      const ip = req.ip || 'unknown';
-      const key = `${type}:${ip}`;
-      const limit = RATE_LIMITS[type];
-      const now = Date.now();
-      const entry = rateLimitStore.get(key);
-      if (!entry || now > entry.resetAt) {
-        rateLimitStore.set(key, { count: 1, resetAt: now + limit.windowMs });
-        return next();
-      }
-      if (entry.count >= limit.max) {
-        console.log(`[Relay RateLimit] Rejected: type=${type}, ip=${maskIp(ip)}, count=${entry.count}, max=${limit.max}, resetsAt=${new Date(entry.resetAt).toISOString()}`);
-        res.status(429).json({ error: 'Too many requests. Please try again later.' });
-        return;
-      }
-      entry.count++;
-      next();
+      const retryAfter = consume(type, clientIp(req));
+      if (retryAfter === null) return next();
+      res.setHeader('Retry-After', String(retryAfter));
+      res.status(429).json({ error: 'Too many requests. Please try again later.' });
     };
   }
 
@@ -432,7 +466,7 @@ export function createRelay(options: RelayOptions): Relay {
   // -------------------------------------------------------------------------
   app.get('/api/v1/challenge', rateLimit('challenge'), async (req: Request, res: Response) => {
     try {
-      const ip = req.ip || 'unknown';
+      const ip = clientIp(req);
       console.log(`[Relay Challenge] GET /api/v1/challenge from IP: ${maskIp(ip)}`);
       const session = await createSession(ip);
       res.json({ requestId: session.requestId, challenge: session.challenge, expiresAt: new Date(session.expiresAt).getTime() });
@@ -445,7 +479,7 @@ export function createRelay(options: RelayOptions): Relay {
   app.post('/api/v1/proof/request', rateLimit('request'), async (req: Request, res: Response) => {
     try {
       const relayBaseUrl = `${req.protocol}://${req.get('host')}`;
-      console.log(`[Relay REST] POST /api/v1/proof/request from IP: ${maskIp(req.ip)}, relayBaseUrl=${relayBaseUrl}, ${describeBody(req.body)}`);
+      console.log(`[Relay REST] POST /api/v1/proof/request from IP: ${maskIp(clientIp(req))}, relayBaseUrl=${relayBaseUrl}, ${describeBody(req.body)}`);
 
       const result = await processProofRequest(req.body || {}, relayBaseUrl);
       if (!result.ok) {
@@ -470,7 +504,7 @@ export function createRelay(options: RelayOptions): Relay {
   app.get('/api/v1/proof/:requestId', async (req: Request, res: Response) => {
     try {
       const requestId = req.params.requestId as string;
-      console.log(`[Relay Poll] GET /api/v1/proof/${requestId} from IP: ${maskIp(req.ip)}`);
+      console.log(`[Relay Poll] GET /api/v1/proof/${requestId} from IP: ${maskIp(clientIp(req))}`);
       await expireIfDue(requestId);
       const status = await lifecycle.getStatus(requestId);
       if (!status) {
@@ -509,7 +543,7 @@ export function createRelay(options: RelayOptions): Relay {
   // consumers must cryptographically verify the ZK proof and expected public inputs.
   app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
-    console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${maskIp(req.ip)}, ${describeBody(body)}`);
+    console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${maskIp(clientIp(req))}, ${describeBody(body)}`);
     try {
       const { requestId, status, errorCode } = body;
 
@@ -621,12 +655,38 @@ export function createRelay(options: RelayOptions): Relay {
   /**
    * Statistics. Bearer-protected; authentication is checked before the query
    * is validated, so an unauthenticated caller learns nothing about the API.
+   *
+   * Order: lockout (statsAuth.ts, shared across instances via Redis) -> token
+   * (constant-time) -> per-instance limit on successful reads -> query.
+   * Same-origin only: SAME_ORIGIN_ONLY keeps CORS headers off this path.
    */
   app.get('/api/v1/stats', async (req: Request, res: Response) => {
-    if (!bearerMatches(req.get('authorization'), statsToken)) {
-      console.log(`[Relay Stats] Rejected: missing or wrong bearer token from IP: ${maskIp(req.ip)}`);
-      res.setHeader('WWW-Authenticate', 'Bearer');
-      res.status(401).json({ error: 'Unauthorized' });
+    res.setHeader('Cache-Control', 'no-store');
+    const ip = clientIp(req);
+    try {
+      const lockedFor = await statsAuth.lockedFor(ip);
+      if (lockedFor > 0) {
+        console.log(`[Relay Stats] Locked out: IP ${maskIp(ip)} for ${lockedFor}s more`);
+        res.setHeader('Retry-After', String(lockedFor));
+        res.status(429).json({ error: 'Too many failed attempts. Try again later.', retryAfterSeconds: lockedFor });
+        return;
+      }
+      if (!bearerMatches(req.get('authorization'), statsToken)) {
+        const failures = await statsAuth.recordFailure(ip);
+        console.log(`[Relay Stats] Rejected: missing or wrong bearer token from IP: ${maskIp(ip)}, failures=${failures}/${STATS_AUTH_MAX_FAILURES}`);
+        res.setHeader('WWW-Authenticate', 'Bearer');
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
+      }
+    } catch (err) {
+      console.error(`[Relay Stats] Auth check failed: ${scrubError(err)}`);
+      res.status(500).json({ error: 'Internal server error' });
+      return;
+    }
+    const retryAfter = consume('stats', ip);
+    if (retryAfter !== null) {
+      res.setHeader('Retry-After', String(retryAfter));
+      res.status(429).json({ error: 'Too many requests. Please try again later.' });
       return;
     }
     const range = checkRange(req.query.from, req.query.to);
@@ -646,6 +706,8 @@ export function createRelay(options: RelayOptions): Relay {
     res.json({ status: 'ok', service: 'proofport-relay', timestamp: new Date().toISOString() });
   });
 
+  mountAdmin(app);
+
   // body-parser's SyntaxError quotes the start of the body it could not parse,
   // and Express's default handler prints that stack. Scrub it here.
   app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
@@ -662,10 +724,19 @@ export function createRelay(options: RelayOptions): Relay {
   // Socket.IO /proof namespace (no JWT middleware — open connections)
   // -------------------------------------------------------------------------
   proofNs.on('connection', (socket: Socket) => {
-    console.log(`[Socket.IO] Client connected: ${socket.id}`);
+    // The handshake request, read the same way as HTTP (clientIp.ts), so a
+    // caller has one rate-limit bucket whichever transport it uses.
+    const ip = clientIp(socket.request);
+    console.log(`[Socket.IO] Client connected: ${socket.id}, ip=${maskIp(ip)}`);
 
     socket.on('proof:request', async (data: Parameters<typeof processProofRequest>[0]) => {
       console.log(`[Socket.IO] proof:request from ${socket.id}: ${describeBody(data)}`);
+      // Same budget as POST /api/v1/proof/request. Until 2026-10-14 this event
+      // had no limit at all, so the HTTP limit could be sidestepped here.
+      if (consume('request', ip) !== null) {
+        socket.emit('proof:error', { error: 'Too many requests. Please try again later.', code: 429 });
+        return;
+      }
       try {
         const result = await processProofRequest(data || {});
         if (!result.ok) {

@@ -71,8 +71,12 @@ Compiled output is in `dist/`.
 ```bash
 ./scripts/test-relay.sh unit          # from the repo root; no services
 ./scripts/test-relay.sh integration   # in-process relays on the dev Redis, DB 15 (flushed)
-./scripts/test-relay.sh e2e           # relay :4001 + test-only relay-b :4011 on one Redis
+./scripts/test-relay.sh e2e           # relay :4001 + test-only relay-b :4011 on one Redis, and /admin in headless Chromium
+./scripts/test-relay.sh image         # builds Dockerfile.prod and checks the admin page's files load from it
+./scripts/test-relay.sh all           # all four
 ```
+
+The admin browser test needs Playwright's headless Chromium once: `npx playwright-core install chromium-headless-shell` (in `proofport-relay`). Screenshots go to a temporary directory the script prints.
 
 ### Type Checking
 
@@ -87,7 +91,7 @@ Environment variables (see `.env.example`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `4001` | Server port |
-| `CORS_ORIGIN` | `*` | CORS allowed origins |
+| `CORS_ORIGIN` | `*` | CORS allowed origins for the public API. Never applied to `/admin` or `/api/v1/stats`, which send no CORS headers at all |
 | `REDIS_URL` | (required) | Redis connection string |
 | `RELAY_EXTERNAL_URL` | (required for production) | External relay URL for deep link callbacks |
 | `RELAY_STATS_TOKEN` | (required, ≥ 32 chars) | Bearer token for `GET /api/v1/stats`. The relay refuses to start without it. Locally `scripts/dev.sh` generates one into `.env.development`; deployed environments read the Google Secret Manager secrets `relay-stats-token-staging` / `relay-stats-token-production` (mounted by `deploy.yml` with `--set-secrets`; GitHub secrets are write-only, so the token could never be read back to call the API) |
@@ -295,7 +299,12 @@ Receive proof completion callback from mobile app.
 - Statistics use the circuit recorded when the request was created, not the `circuit` the callback claims
 
 #### GET /api/v1/stats
-Per-circuit request statistics, per UTC day. `Authorization: Bearer <RELAY_STATS_TOKEN>` is required (401 otherwise, checked before anything else).
+Per-circuit request statistics, per UTC day. `Authorization: Bearer <RELAY_STATS_TOKEN>` is required (401 otherwise, checked before anything else). The comparison is constant-time.
+
+- **Same origin only.** No CORS headers, whatever `CORS_ORIGIN` says: a browser on another origin cannot call it, token or not. The admin page (`/admin`) is same-origin.
+- **Wrong-token lockout.** 10 wrong or missing tokens from one caller within 15 minutes, and every stats call from that caller answers **429** with `Retry-After` until the window ends -- the right token included. Counted in Redis (`relay:stats-auth-fail:<sha256 of the address>`, 15-minute TTL), so it holds across all Cloud Run instances; the address itself is never stored.
+- **Read limit.** 60 successful calls per minute per caller per instance, then 429.
+- Responses carry `Cache-Control: no-store`. If the lockout store (Redis) fails, the answer is 500, never the data.
 
 `GET /api/v1/stats?from=2026-10-01&to=2026-10-14` — both required, `YYYY-MM-DD` (UTC), real calendar dates, `from <= to`, at most 400 days inclusive (400 otherwise).
 
@@ -328,6 +337,15 @@ Per-circuit request statistics, per UTC day. `Authorization: Bearer <RELAY_STATS
 The relay answers the dApp itself when the app has not answered within **280 s** (`REQUEST_DEADLINE_MS` in `src/app.ts`), 20 s before the SDK's default 300 s wait gives up. The result is `{ "status": "expired", "error": "The request timed out before the app answered" }`, delivered over `proof:result` and polling like any other terminal status, and counted as `expired`. A late app callback gets 409 `{ "error": "The request timed out before the app answered", "reason": "expired" }`.
 
 Deadlines live in the Redis sorted set `proof:deadlines`, not in process memory: every instance sweeps it every 5 s, the atomic terminal script lets exactly one instance win each expiry, and a poll, subscribe or callback that touches an overdue request expires it on the spot.
+
+#### GET /admin
+Admin dashboard for the statistics above: log in with the stats token, pick a range (last 7 / 30 / 90 days, or any range up to 400 days), and read per-circuit totals (requested, completed, error, cancelled, expired, success rate = completed / requested, `—` when nothing was requested), errors by code with the app's label for known `E` codes, a per-day chart and a per-day table. All dates are UTC days. An empty range says so.
+
+- **The token.** Get it with `./scripts/relay-stats-token.sh <staging|production>` from the repository root (add `--copy` to put it on the clipboard instead of printing it). It reads the Google Secret Manager secret `relay-stats-token-<env>` in project `masselabs-zkproofport`; you need `gcloud auth login` as an account allowed to read it. Locally the token is `RELAY_STATS_TOKEN` in `.env.development`.
+- **Rotation.** Add a new secret version (`openssl rand -hex 32 | tr -d '\n' | gcloud secrets versions add relay-stats-token-<env> --project masselabs-zkproofport --data-file=-`), then redeploy the relay (`deploy.yml`, service `relay`) -- Cloud Run reads `:latest` at deploy time. A page still holding the old token returns to the login view on its next call.
+- **Where the token lives in the browser.** `sessionStorage` of that tab only: gone when the tab closes, never in the URL, a cookie or `localStorage`. *로그아웃* clears it.
+- **What is served.** `GET /admin` (HTML), `/admin/admin.css`, `/admin/app.mjs`, `/admin/core.mjs` -- read from `src/admin/` (copied to `dist/admin/` by `npm run build`) once at startup; a relay built without them refuses to start. Anything else under `/admin` is 404. No external CDN, framework or build step.
+- **Headers** on all of them: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` (no inline script or style), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, `X-Robots-Tag: noindex`. Every value from the API is written with `textContent`, never `innerHTML`.
 
 #### GET /health
 Health check endpoint.
@@ -423,14 +441,18 @@ Socket.IO uses the Redis adapter (`@socket.io/redis-adapter`) on the same Redis,
 
 ## Rate Limiting
 
-IP-based in-memory sliding window rate limiting:
+Per caller address, in memory, per instance, fixed 1-minute windows:
 
 | Endpoint | Limit | Window |
 |----------|-------|--------|
 | `GET /api/v1/challenge` | 30 requests | 1 minute per IP |
-| `POST /api/v1/proof/request` | 10 requests | 1 minute per IP |
+| `POST /api/v1/proof/request` and Socket.IO `proof:request` (one shared budget) | 10 requests | 1 minute per IP |
+| `GET /api/v1/stats` (authenticated) | 60 requests | 1 minute per IP |
+| `GET /api/v1/stats` wrong token | 10 failures, then locked | 15 minutes per IP, across all instances (Redis) |
 
-Exceeding limits returns HTTP 429.
+Exceeding limits returns HTTP 429 with `Retry-After` (a socket gets `proof:error` with `code: 429`).
+
+**Which address.** `app.set('trust proxy', 1)` (`TRUSTED_PROXY_HOPS` in `src/clientIp.ts`): the relay's hostnames are Cloud Run domain mappings, and Google's front end appends the caller's address as the rightmost `X-Forwarded-For` entry; that entry is the caller, everything to its left is whatever the client wrote. `clientIp()` computes it the way Express computes `req.ip`, and HTTP routes and Socket.IO handshakes both use it. Before this, every request read the front end's own address (`169.254.169.126`), so each limit was one bucket for everyone. Never set it to `true` (that trusts the client-written leftmost entry). If a load balancer or CDN is ever put in front, the hop count changes -- see the comment on `TRUSTED_PROXY_HOPS`. Locally there is no front end: a request without the header is counted under Docker's gateway address, and one with it under its rightmost entry.
 
 ## Storage
 
@@ -446,9 +468,10 @@ All session data cached in Redis with TTL:
 | `proof:inputsHash:{requestId}` | 10 min | SHA256 hash of proof inputs |
 | `session:{requestId}` | 10 min | Challenge session |
 | `proof:meta:{requestId}` | 10 min | Circuit as requested and the deadline (relay-internal) |
-| `proof:terminal:{requestId}` | 10 min | The terminal status taken; makes the terminal transition one-way |
+| `proof:terminal:{requestId}` | 7 days | The terminal status taken; makes the terminal transition one-way |
 | `proof:deadlines` | — | Sorted set of open requests by deadline (ms) |
 | `relay:stats:{YYYY-MM-DD}` | 400 days | Per-circuit counters (see `GET /api/v1/stats`) |
+| `relay:stats-auth-fail:{sha256(ip)}` | 15 min | Wrong stats tokens from one caller (lockout at 10) |
 
 ## Deep Link Format
 

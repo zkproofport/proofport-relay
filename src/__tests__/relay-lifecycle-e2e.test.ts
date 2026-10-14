@@ -11,9 +11,9 @@
  * Run: `scripts/test-relay.sh e2e` -- it starts relay-b, passes the env below
  * and removes relay-b afterwards.
  *
- * Every proof request here is created on relay-b: the request endpoint is
- * capped at 10/min per IP per instance, and relay-e2e.test.ts spends relay's
- * whole budget. This file makes 7.
+ * Every proof request here is created on relay-b, under this run's own
+ * X-Forwarded-For address (CALLER): the request endpoint is capped at 10/min
+ * per caller per instance. This file makes 7.
  */
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import Redis from 'ioredis';
@@ -50,11 +50,18 @@ afterAll(async () => {
   await redis.quit();
 });
 
+/**
+ * This run's caller address (the relay trusts one X-Forwarded-For hop,
+ * src/clientIp.ts). Without it every run is counted under Docker's gateway
+ * address, and two runs inside a minute exhaust the 10/min request budget.
+ */
+const CALLER = { 'X-Forwarded-For': `198.18.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 254) + 1}` };
+
 async function createRequest(url: string): Promise<string> {
-  const ch = await (await fetch(`${url}/api/v1/challenge`)).json() as { requestId: string; challenge: string };
+  const ch = await (await fetch(`${url}/api/v1/challenge`, { headers: CALLER })).json() as { requestId: string; challenge: string };
   const res = await fetch(`${url}/api/v1/proof/request`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { ...CALLER, 'Content-Type': 'application/json' },
     body: JSON.stringify({ requestId: ch.requestId, challenge: ch.challenge, circuitId: CIRCUIT, inputs: { scope: 'e2e.example' } }),
   });
   if (res.status === 429) throw new Error(`${url} rate-limited proof requests (10/min per IP); wait a minute and re-run.`);
@@ -192,8 +199,12 @@ describe('relay-side timeout in the containers', () => {
 
 describe('GET /api/v1/stats on the container', () => {
   it('401 without or with a wrong token; 400 for bad dates, from > to, range too long', async () => {
-    expect((await fetch(`${A}/api/v1/stats?from=2026-10-14&to=2026-10-14`)).status).toBe(401);
-    expect((await fetch(`${A}/api/v1/stats?from=2026-10-14&to=2026-10-14`, { headers: { Authorization: 'Bearer wrong' } })).status).toBe(401);
+    // Wrong tokens are counted per caller in Redis for 15 minutes (statsAuth.ts).
+    // Sent from the host's own address they would add up across runs and lock
+    // the other tests' stats reads out, so these two carry a fresh
+    // X-Forwarded-For entry standing in for Google's front end (CALLER).
+    expect((await fetch(`${A}/api/v1/stats?from=2026-10-14&to=2026-10-14`, { headers: CALLER })).status).toBe(401);
+    expect((await fetch(`${A}/api/v1/stats?from=2026-10-14&to=2026-10-14`, { headers: { ...CALLER, Authorization: 'Bearer wrong' } })).status).toBe(401);
     const get = (qs: string) => fetch(`${A}/api/v1/stats?${qs}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
     expect((await get('from=2026-02-30&to=2026-03-01')).status).toBe(400);
     expect((await get('from=2026-10-15&to=2026-10-14')).status).toBe(400);

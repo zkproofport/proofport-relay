@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex">
+  <title>Relay 관리자</title>
+  <link rel="stylesheet" href="/admin/admin.css">
+  <script type="module" src="/admin/app.mjs"></script>
+</head>
+<body>
+  <main>
+    <section id="login-view" aria-labelledby="login-title">
+      <h1 id="login-title">ZKProofport Relay 관리자</h1>
+      <!-- No name on the input and no action: if the script never loads, the
+           browser has nothing to submit, and CSP form-action 'none' blocks it anyway. -->
+      <form id="login-form" novalidate>
+        <label for="token-input">통계 토큰</label>
+        <input id="token-input" type="password" autocomplete="off" spellcheck="false" autocapitalize="off">
+        <button type="submit" id="login-button">로그인</button>
+        <p id="login-error" class="error" role="alert" hidden></p>
+      </form>
+      <p class="hint">토큰은 이 탭에만 보관되며 탭을 닫으면 지워집니다.</p>
+      <noscript><p class="error">이 페이지는 JavaScript가 필요합니다.</p></noscript>
+    </section>
+
+    <section id="dashboard-view" hidden aria-labelledby="dashboard-title">
+      <header class="topbar">
+        <h1 id="dashboard-title">Relay 요청 통계</h1>
+        <button type="button" id="logout-button">로그아웃</button>
+      </header>
+
+      <div class="controls">
+        <div class="presets" role="group" aria-label="기간 빠른 선택">
+          <button type="button" class="preset" data-days="7">최근 7일</button>
+          <button type="button" class="preset" data-days="30">최근 30일</button>
+          <button type="button" class="preset" data-days="90">최근 90일</button>
+        </div>
+        <form id="range-form" class="range" novalidate>
+          <label>시작 (UTC) <input id="from-input" type="date"></label>
+          <label>종료 (UTC) <input id="to-input" type="date"></label>
+          <button type="submit">조회</button>
+        </form>
+        <label class="circuit-filter">회로
+          <select id="circuit-select"><option value="all">전체</option></select>
+        </label>
+      </div>
+
+      <p id="range-label" class="muted"></p>
+      <p id="dashboard-error" class="error" role="alert" hidden></p>
+      <p id="loading" class="muted" hidden>불러오는 중…</p>
+
+      <div id="empty-state" class="empty" hidden>
+        <p>이 기간에는 기록된 요청이 없습니다.</p>
+      </div>
+
+      <div id="content" hidden>
+        <section class="tiles" aria-label="합계">
+          <div class="tile"><span class="tile-label">요청</span><span class="tile-value" id="tile-requested"></span></div>
+          <div class="tile"><span class="tile-label">완료</span><span class="tile-value" id="tile-completed"></span></div>
+          <div class="tile"><span class="tile-label">오류</span><span class="tile-value" id="tile-error"></span></div>
+          <div class="tile"><span class="tile-label">취소</span><span class="tile-value" id="tile-cancelled"></span></div>
+          <div class="tile"><span class="tile-label">만료</span><span class="tile-value" id="tile-expired"></span></div>
+          <div class="tile"><span class="tile-label">성공률</span><span class="tile-value" id="tile-rate"></span></div>
+        </section>
+
+        <section class="panel">
+          <h2>일별 요청 · 완료 (UTC)</h2>
+          <ul class="legend">
+            <li><span class="swatch swatch-requested"></span>요청</li>
+            <li><span class="swatch swatch-completed"></span>완료</li>
+          </ul>
+          <div id="chart" class="chart"></div>
+        </section>
+
+        <section class="panel">
+          <h2>회로별 합계</h2>
+          <div class="table-wrap">
+            <table id="circuit-table">
+              <thead><tr><th scope="col">회로</th><th scope="col">요청</th><th scope="col">완료</th><th scope="col">오류</th><th scope="col">취소</th><th scope="col">만료</th><th scope="col">성공률</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="muted small">성공률 = 완료 ÷ 요청. 요청이 0이면 —.</p>
+        </section>
+
+        <section class="panel">
+          <h2>오류 코드별</h2>
+          <p id="no-errors" class="muted" hidden>이 기간에 오류가 없습니다.</p>
+          <div class="table-wrap">
+            <table id="error-table">
+              <thead><tr><th scope="col">회로</th><th scope="col">코드</th><th scope="col">설명</th><th scope="col">건수</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>일별 (UTC)</h2>
+          <div class="table-wrap">
+            <table id="day-table">
+              <thead><tr><th scope="col">날짜</th><th scope="col">요청</th><th scope="col">완료</th><th scope="col">오류</th><th scope="col">취소</th><th scope="col">만료</th><th scope="col">성공률</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <p id="unrecognized" class="muted small" hidden></p>
+      </div>
+      <p id="fetched-at" class="muted small"></p>
+    </section>
+  </main>
+</body>
+</html>

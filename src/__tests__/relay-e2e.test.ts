@@ -8,18 +8,28 @@
  * Run:
  *   npx vitest run src/__tests__/relay-e2e.test.ts
  *
- * NOTE: POST /api/v1/proof/request is rate limited to 10 per minute per IP
- * (RATE_LIMITS.request in src/index.ts) and this suite makes exactly 10 of
- * them — there is no headroom. Two runs inside the same minute will 429, and
- * any new test that posts a proof request must either replace an existing one
- * or come with a raised limit. `expectCreated()` reports a 429 as such instead
- * of leaving a bare "expected 429 to be 201".
+ * NOTE: POST /api/v1/proof/request is rate limited to 10 per minute per
+ * caller (RATE_LIMITS.request in src/app.ts) and this suite makes exactly 10
+ * of them. Every request here therefore carries an X-Forwarded-For address of
+ * its own for this run (the relay trusts one hop, src/clientIp.ts), so two runs
+ * inside the same minute no longer share -- and exhaust -- one bucket, as they
+ * did while every local call was counted under Docker's gateway address.
+ * A new test that posts a proof request still needs the limit in mind: 10 per
+ * run. `expectCreated()` reports a 429 as such instead of a bare mismatch.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { ethers } from 'ethers';
 import { createHash } from 'crypto';
 
 const RELAY_URL = process.env.RELAY_URL || 'http://localhost:4001';
+
+/** This run's caller address, standing in for the one Google's front end would append. */
+const CALLER_IP = `198.18.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 254) + 1}`;
+
+/** Every call in this file goes out as CALLER_IP. */
+function fetch(url: string, init: RequestInit = {}): Promise<Response> {
+  return globalThis.fetch(url, { ...init, headers: { 'X-Forwarded-For': CALLER_IP, ...(init.headers as Record<string, string> | undefined) } });
+}
 
 interface ChallengeData {
   /** Session id issued with the challenge; every proof request must echo it back. */
