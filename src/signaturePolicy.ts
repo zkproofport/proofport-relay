@@ -30,6 +30,9 @@ export const SIGNATURE_POLICY = {
   // `false` because it sat under the Web2 comment above and nobody revisited
   // it, so a GIWA request reached the relay with no signature required.
   giwa_attestation: true,
+  // The wallet signs the request, and the circuit checks that the same key
+  // signed its Playground faucet transaction.
+  dojang_playground: true,
   // `satisfies` and not an annotation: an annotation on the const would be
   // checked THROUGH Object.freeze(), which is a generic call and so swallows
   // excess-property checking. That version compiled cleanly with a key the
