@@ -90,7 +90,7 @@ describe('/admin on the container', () => {
 });
 
 describe('GET /api/v1/stats on the container: CORS and lockout', () => {
-  it('no CORS headers for another origin, on the preflight or the call, even though CORS_ORIGIN is *', async () => {
+  it('no CORS headers for another origin, on the preflight or the call, even though the public API allows any origin', async () => {
     const pre = await fetch(`${A}/api/v1/stats?from=2026-10-14&to=2026-10-14`, {
       method: 'OPTIONS',
       headers: { Origin: 'https://evil.example', 'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'authorization' },

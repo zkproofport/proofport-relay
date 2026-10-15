@@ -33,14 +33,13 @@ afterEach(async () => {
   for (const c of closers.splice(0)) await c();
 });
 
-async function startRelay(opts: { statsAuth?: StatsAuthGuard; corsOrigin?: string | string[] } = {}): Promise<{ relay: Relay; url: string }> {
+async function startRelay(opts: { statsAuth?: StatsAuthGuard } = {}): Promise<{ relay: Relay; url: string }> {
   const relay = createRelay({
     redis: throwingRedis,
     stats: { record() {} },
     statsToken: TOKEN,
     statsAuth: opts.statsAuth ?? { lockedFor: async () => 0, recordFailure: async () => 1 },
     adapter: null,
-    corsOrigin: opts.corsOrigin ?? '*',
     relayExternalUrl: '',
     port: 0,
     deadlineMs: 3_600_000,
@@ -161,9 +160,8 @@ describe('admin page and assets', () => {
 });
 
 describe('CORS on the admin page and the stats API', () => {
-  it.each([['*'], [['https://demo.zkproofport.app']]])('CORS_ORIGIN=%j: no other origin gets CORS headers on /api/v1/stats or /admin', async (origin) => {
-    const { url } = await startRelay({ corsOrigin: origin as string | string[] });
-    const from = origin === '*' ? 'https://evil.example' : 'https://demo.zkproofport.app';
+  it.each(['https://evil.example', 'https://demo.zkproofport.app'])('%s gets no CORS headers on /api/v1/stats or /admin', async (from) => {
+    const { url } = await startRelay();
     const preflight = await fetch(`${url}/api/v1/stats?from=2026-10-14&to=2026-10-14`, {
       method: 'OPTIONS',
       headers: { Origin: from, 'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'authorization' },
@@ -177,14 +175,35 @@ describe('CORS on the admin page and the stats API', () => {
     expect(upper.headers.get('access-control-allow-origin')).toBeNull();
   });
 
-  it('the public API keeps its CORS (the SDK calls it cross-origin)', async () => {
-    const { url } = await startRelay({ corsOrigin: '*' });
-    const preflight = await fetch(`${url}/api/v1/challenge`, {
-      method: 'OPTIONS',
-      headers: { Origin: 'https://dapp.example', 'Access-Control-Request-Method': 'GET' },
-    });
-    expect(preflight.headers.get('access-control-allow-origin')).toBe('*');
-  });
+  // Any dApp's page, including one nobody registered and a developer's localhost.
+  it.each(['https://dapp.example', 'https://dojangscan.com', 'http://localhost:3000', 'null'])(
+    'the public API answers a browser on %s (the SDK calls it cross-origin)',
+    async (from) => {
+      const { url } = await startRelay();
+      const calls: Array<[string, string, string?]> = [
+        ['/api/v1/challenge', 'GET'],
+        ['/api/v1/proof/request', 'POST', 'content-type'],
+        ['/api/v1/proof/00000000-0000-4000-8000-000000000000', 'GET'],
+      ];
+      for (const [path, method, headers] of calls) {
+        const preflight = await fetch(`${url}${path}`, {
+          method: 'OPTIONS',
+          headers: {
+            Origin: from,
+            'Access-Control-Request-Method': method,
+            ...(headers ? { 'Access-Control-Request-Headers': headers } : {}),
+          },
+        });
+        expect(preflight.status).toBe(204);
+        expect(preflight.headers.get('access-control-allow-origin')).toBe('*');
+        expect(preflight.headers.get('access-control-allow-methods')).toContain(method);
+        // No cookie may ride along: a credentialed CORS answer would need the exact origin.
+        expect(preflight.headers.get('access-control-allow-credentials')).toBeNull();
+      }
+      const socket = await fetch(`${url}/socket.io/?EIO=4&transport=polling`, { headers: { Origin: from } });
+      expect(socket.headers.get('access-control-allow-origin')).toBe('*');
+    },
+  );
 });
 
 describe('GET /api/v1/stats auth (lockout store stubbed)', () => {

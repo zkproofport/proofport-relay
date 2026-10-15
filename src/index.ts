@@ -31,13 +31,6 @@ if (RELAY_STATS_TOKEN.length < 32) {
   throw new Error(`RELAY_STATS_TOKEN must be at least 32 characters (got ${RELAY_STATS_TOKEN.length}); generate one with: openssl rand -hex 32`);
 }
 
-if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.CORS_ORIGIN) {
-  throw new Error('CORS_ORIGIN environment variable is required in production/staging');
-}
-const CORS_ORIGIN: string | string[] = process.env.CORS_ORIGIN
-  ? (process.env.CORS_ORIGIN === '*' ? '*' : process.env.CORS_ORIGIN.split(',').map((s) => s.trim()))
-  : '*';
-
 if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.RELAY_EXTERNAL_URL) {
   throw new Error('RELAY_EXTERNAL_URL environment variable is required in production/staging');
 }
@@ -72,7 +65,6 @@ async function main() {
     // Without an adapter an emit only reaches sockets on THIS instance. Cloud
     // Run runs up to 20, and the app's callback lands on any of them.
     adapter: createAdapter(pub, sub),
-    corsOrigin: CORS_ORIGIN,
     relayExternalUrl: RELAY_EXTERNAL_URL,
     port: PORT,
     deadlineMs: REQUEST_DEADLINE_MS,

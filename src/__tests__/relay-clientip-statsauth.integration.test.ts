@@ -52,7 +52,6 @@ async function start(): Promise<string> {
     stats: createStatsRecorder(redis),
     statsToken: TOKEN,
     adapter: null,
-    corsOrigin: '*',
     relayExternalUrl: '',
     port: 0,
     deadlineMs: LONG,

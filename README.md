@@ -91,7 +91,6 @@ Environment variables (see `.env.example`):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `4001` | Server port |
-| `CORS_ORIGIN` | `*` | CORS allowed origins for the public API. Never applied to `/admin` or `/api/v1/stats`, which send no CORS headers at all |
 | `REDIS_URL` | (required) | Redis connection string |
 | `RELAY_EXTERNAL_URL` | (required for production) | External relay URL for deep link callbacks |
 | `RELAY_STATS_TOKEN` | (required, ≥ 32 chars) | Bearer token for `GET /api/v1/stats`. The relay refuses to start without it. Locally `scripts/dev.sh` generates one into `.env.development`; deployed environments read the Google Secret Manager secrets `relay-stats-token-staging` / `relay-stats-token-production` (mounted by `deploy.yml` with `--set-secrets`; GitHub secrets are write-only, so the token could never be read back to call the API) |
@@ -301,7 +300,7 @@ Receive proof completion callback from mobile app.
 #### GET /api/v1/stats
 Per-circuit request statistics, per UTC day. `Authorization: Bearer <RELAY_STATS_TOKEN>` is required (401 otherwise, checked before anything else). The comparison is constant-time.
 
-- **Same origin only.** No CORS headers, whatever `CORS_ORIGIN` says: a browser on another origin cannot call it, token or not. The admin page (`/admin`) is same-origin.
+- **Same origin only.** No CORS headers, although every public path allows any origin: a browser on another origin cannot call it, token or not. The admin page (`/admin`) is same-origin.
 - **Wrong-token lockout.** 10 wrong or missing tokens from one caller within 15 minutes, and every stats call from that caller answers **429** with `Retry-After` until the window ends -- the right token included. Counted in Redis (`relay:stats-auth-fail:<sha256 of the address>`, 15-minute TTL), so it holds across all Cloud Run instances; the address itself is never stored.
 - **Read limit.** 60 successful calls per minute per caller per instance, then 429.
 - Responses carry `Cache-Control: no-store`. If the lockout store (Redis) fails, the answer is 500, never the data.

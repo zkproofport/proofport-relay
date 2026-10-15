@@ -64,11 +64,22 @@ const RATE_LIMITS = {
 
 /**
  * Paths no other origin may call from a browser: the admin page and the
- * stats API it reads. They get no CORS headers at all, whatever CORS_ORIGIN
- * says, so a cross-origin `fetch` -- with or without the token -- is blocked
+ * stats API it reads. They get no CORS headers at all, though every other
+ * path allows any origin, so a cross-origin `fetch` -- with or without the token -- is blocked
  * by the browser, and a preflight for the Authorization header is refused.
  * The page itself is same-origin and needs no CORS.
  */
+/**
+ * Every other path is called from whatever page a dApp runs on, and nobody can
+ * list those in advance, so any origin may call it. The origin was never what
+ * protected the relay: CORS binds browsers only, a server calls it with or
+ * without a header, and a request is authenticated by its challenge and
+ * signature. An allowlist stopped one kind of caller: a dApp using the SDK from
+ * a browser, which is the normal integration (dojangscan.com, 2026-10-15).
+ * No credentials are sent or accepted, so `*` exposes no cookie.
+ */
+const PUBLIC_CORS_ORIGIN = '*';
+
 const SAME_ORIGIN_ONLY = [/^\/api\/v1\/stats(\/|$)/i, /^\/admin(\/|$)/i];
 
 export interface RelayOptions {
@@ -81,7 +92,6 @@ export interface RelayOptions {
   statsAuth?: StatsAuthGuard;
   /** Socket.IO adapter. The Redis adapter in every deployment; null only for a single in-process test instance. */
   adapter: ServerOptions['adapter'] | null;
-  corsOrigin: string | string[];
   /** Public base URL the app posts callbacks to; empty means "derive from the request". */
   relayExternalUrl: string;
   port: number;
@@ -132,7 +142,7 @@ export function createRelay(options: RelayOptions): Relay {
   app.set('trust proxy', TRUSTED_PROXY_HOPS);
 
   app.use(helmet());
-  const corsMiddleware = cors({ origin: options.corsOrigin });
+  const corsMiddleware = cors({ origin: PUBLIC_CORS_ORIGIN });
   app.use((req: Request, res: Response, next: NextFunction) => {
     if (SAME_ORIGIN_ONLY.some((re) => re.test(req.path))) return next();
     corsMiddleware(req, res, next);
@@ -140,7 +150,7 @@ export function createRelay(options: RelayOptions): Relay {
   app.use(express.json({ limit: '1mb' }));
 
   const io = new Server(httpServer, {
-    cors: { origin: options.corsOrigin, methods: ['GET', 'POST'] },
+    cors: { origin: PUBLIC_CORS_ORIGIN, methods: ['GET', 'POST'] },
     path: '/socket.io',
     ...(options.adapter ? { adapter: options.adapter } : {}),
   });

@@ -69,7 +69,6 @@ async function start(opts: {
     stats: opts.stats ?? createStatsRecorder(redis),
     statsToken: STATS_TOKEN,
     adapter,
-    corsOrigin: '*',
     relayExternalUrl: '',
     port: 0,
     deadlineMs: opts.deadlineMs ?? LONG,
