@@ -63,6 +63,13 @@ export interface RequestMeta {
   circuitId: string;
   /** Unix ms after which the relay answers the dApp with `expired`. */
   deadlineAt: number;
+  /**
+   * Stats labels taken at creation (labels.ts), so a terminal outcome is
+   * counted under the same origin and scope as its request. Absent on requests
+   * opened by a relay that did not record them; those outcomes are counted by
+   * circuit only.
+   */
+  labels?: { origin: string; scope: string };
 }
 
 export interface ProofStatus {

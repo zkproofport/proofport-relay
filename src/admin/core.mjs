@@ -215,3 +215,148 @@ export function retryAfterMinutes(header) {
   if (!Number.isFinite(s) || s <= 0) return null;
   return Math.ceil(s / 60);
 }
+
+// ---------------------------------------------------------------------------
+// Labels: the page that asked (origin), the dApp's scope, the country the
+// app answered from. Totals over the range only; the relay does not keep them
+// per day per circuit per error code.
+// ---------------------------------------------------------------------------
+
+export const DIMENSIONS = ['origin', 'scope', 'country'];
+
+/** How each marker reads on the page; a stored value is shown as itself. */
+export const MARKER_TEXT = {
+  none: '(보내지 않음)',
+  invalid: '(형식이 맞지 않음)',
+  'too-long': '(너무 김)',
+  unknown: '(위치를 알 수 없음)',
+  other: '(기타 — 그날 종류가 500개를 넘음)',
+};
+
+function flatOutcomes(counts) {
+  return {
+    requested: counts.requested,
+    completed: counts.completed,
+    error: counts.error,
+    cancelled: counts.cancelled,
+    expired: counts.expired,
+  };
+}
+
+/** The rows of one label kind, or an empty object from a relay that has none. */
+function labelRows(report, kind) {
+  if (!DIMENSIONS.includes(kind)) throw new Error(`Unknown label kind '${kind}'. Known: ${DIMENSIONS.join(', ')}.`);
+  const all = report.dimensions || {};
+  return Object.prototype.hasOwnProperty.call(all, kind) ? all[kind] : {};
+}
+
+/** What a label shows on the page. Display only; a code with no country name shows the code. */
+export function labelText(row, kind) {
+  if (row.marker !== null && row.marker !== undefined) {
+    return Object.prototype.hasOwnProperty.call(MARKER_TEXT, row.marker) ? MARKER_TEXT[row.marker] : `(${row.marker})`;
+  }
+  if (kind === 'country') return countryName(row.value);
+  return row.value;
+}
+
+/** "대한민국 (KR)"; the bare code when the runtime has no name for it. */
+export function countryName(code) {
+  try {
+    const name = new Intl.DisplayNames(['ko'], { type: 'region' }).of(code);
+    return name && name !== code ? `${name} (${code})` : code;
+  } catch {
+    return code;
+  }
+}
+
+/**
+ * One row per label of `kind`, busiest first: requests, then answers (country
+ * has no requests: it is recorded only when the app answers), then the label.
+ * With a circuit, only that circuit's counts.
+ */
+export function dimensionRows(report, kind, circuit = 'all') {
+  const rows = [];
+  for (const [key, row] of Object.entries(labelRows(report, kind))) {
+    const counts = circuit === 'all' ? row.all : row.circuits[circuit];
+    if (!counts) continue;
+    const f = flatOutcomes(counts);
+    rows.push({ key, label: labelText(row, kind), ...f, rate: successRate(f.completed, f.requested) });
+  }
+  const answered = (r) => r.completed + r.error + r.cancelled;
+  return rows.sort((a, b) => b.requested - a.requested || answered(b) - answered(a) || a.label.localeCompare(b.label));
+}
+
+/** Per-circuit rows for one label, in the shape circuitRows() returns. */
+export function labelCircuitRows(report, kind, key) {
+  const row = labelRows(report, kind)[key];
+  if (!row) return [];
+  return Object.entries(row.circuits)
+    .map(([circuit, counts]) => {
+      const f = flatOutcomes(counts);
+      return { circuit, ...f, rate: successRate(f.completed, f.requested) };
+    })
+    .sort((a, b) => b.requested - a.requested || a.circuit.localeCompare(b.circuit));
+}
+
+/** Totals for one label (one circuit or all); zeros when the label has none of that circuit. */
+export function labelTotals(report, kind, key, circuit = 'all') {
+  const row = labelRows(report, kind)[key];
+  const counts = row && (circuit === 'all' ? row.all : row.circuits[circuit]);
+  const f = counts ? flatOutcomes(counts) : { requested: 0, completed: 0, error: 0, cancelled: 0, expired: 0 };
+  return { ...f, rate: successRate(f.completed, f.requested) };
+}
+
+// ---------------------------------------------------------------------------
+// Country map
+// ---------------------------------------------------------------------------
+
+/** Number of shades on the map, lightest (1) to darkest; 0 = no answers. */
+export const MAP_SHADES = 5;
+
+/** Answers the app sent from a country: completed + error + cancelled. */
+export function answered(counts) {
+  return counts.completed + counts.error + counts.cancelled;
+}
+
+/**
+ * Shade 0..MAP_SHADES for a count, on a log scale so one busy country does not
+ * wash every other one out to the lightest shade.
+ */
+export function shadeFor(count, max) {
+  if (!(count > 0) || !(max > 0)) return 0;
+  if (max === 1) return MAP_SHADES;
+  const step = Math.ceil((Math.log(count) / Math.log(max)) * (MAP_SHADES - 1)) + 1;
+  return Math.min(MAP_SHADES, Math.max(1, step));
+}
+
+/**
+ * Per-country answers for the map: { [code]: { count, shade } } for countries
+ * with at least one answer. Markers (unknown, invalid, other) have no shape
+ * and are left to the table.
+ */
+export function mapShades(report, circuit = 'all') {
+  const counts = {};
+  for (const [, row] of Object.entries(labelRows(report, 'country'))) {
+    if (row.marker !== null || typeof row.value !== 'string') continue;
+    const c = circuit === 'all' ? row.all : row.circuits[circuit];
+    if (!c || answered(c) === 0) continue;
+    counts[row.value] = answered(c);
+  }
+  const max = Math.max(0, ...Object.values(counts));
+  const out = {};
+  for (const [code, count] of Object.entries(counts)) out[code] = { count, shade: shadeFor(count, max) };
+  return out;
+}
+
+/** What one country shows when clicked: per-circuit answers, busiest first. */
+export function countryDetail(report, code) {
+  const row = labelRows(report, 'country')[`v:${encodeURIComponent(code)}`];
+  const empty = { code, name: countryName(code), total: { completed: 0, error: 0, cancelled: 0, answered: 0 }, circuits: [] };
+  if (!row) return empty;
+  const circuits = Object.entries(row.circuits)
+    .map(([circuit, c]) => ({ circuit, completed: c.completed, error: c.error, cancelled: c.cancelled, answered: answered(c) }))
+    .filter((r) => r.answered > 0)
+    .sort((a, b) => b.answered - a.answered || a.circuit.localeCompare(b.circuit));
+  const a = row.all;
+  return { code, name: countryName(code), total: { completed: a.completed, error: a.error, cancelled: a.cancelled, answered: answered(a) }, circuits };
+}

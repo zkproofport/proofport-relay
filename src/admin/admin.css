@@ -106,3 +106,36 @@ th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--bo
 th:first-child, td:first-child { text-align: left; }
 #error-table td:nth-child(2), #error-table td:nth-child(3), #error-table th:nth-child(2), #error-table th:nth-child(3) { text-align: left; }
 thead th { color: var(--text-secondary); font-weight: 600; }
+
+/* Country map: shade-0 is "no answers", 1..5 light to dark. */
+:root {
+  --map-0: #e6e5e0; --map-1: #c9dcf5; --map-2: #93bbec; --map-3: #5a97e0; --map-4: #2a78d6; --map-5: #17488a;
+  --map-edge: var(--surface-1); --map-focus: var(--text-primary);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --map-0: #2b2b29; --map-1: #1d3556; --map-2: #24528a; --map-3: #2f6fbd; --map-4: #3987e5; --map-5: #8dbcf3;
+  }
+}
+:root[data-theme="dark"] {
+  --map-0: #2b2b29; --map-1: #1d3556; --map-2: #24528a; --map-3: #2f6fbd; --map-4: #3987e5; --map-5: #8dbcf3;
+}
+.map-layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 760px) { .map-layout { grid-template-columns: 1fr; } }
+.world-map svg { width: 100%; height: auto; display: block; }
+.country { stroke: var(--map-edge); stroke-width: 0.4; }
+.country[role='button'] { cursor: pointer; }
+.country:focus { outline: none; stroke: var(--map-focus); stroke-width: 1.2; }
+.country.selected { stroke: var(--map-focus); stroke-width: 1.4; }
+.country.shade-0 { fill: var(--map-0); } .country.shade-1 { fill: var(--map-1); } .country.shade-2 { fill: var(--map-2); }
+.country.shade-3 { fill: var(--map-3); } .country.shade-4 { fill: var(--map-4); } .country.shade-5 { fill: var(--map-5); }
+.swatch.shade-0 { background: var(--map-0); } .swatch.shade-1 { background: var(--map-1); } .swatch.shade-2 { background: var(--map-2); }
+.swatch.shade-3 { background: var(--map-3); } .swatch.shade-4 { background: var(--map-4); } .swatch.shade-5 { background: var(--map-5); }
+.country-detail { border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 120px; background: var(--surface-1); }
+.country-detail h3 { margin: 0 0 6px; font-size: 1rem; }
+.country-detail { overflow-x: auto; }
+.country-detail table { width: 100%; font-size: 0.8rem; }
+.country-detail th, .country-detail td { padding: 4px 6px; white-space: nowrap; }
+.country-detail td:first-child { white-space: normal; word-break: break-all; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover, tr.clickable:focus { background: var(--surface-0); outline: none; }

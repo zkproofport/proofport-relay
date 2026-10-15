@@ -6,9 +6,14 @@ import {
   chartGeometry,
   checkRange,
   circuitRows,
+  countryDetail,
+  mapShades,
   dailyRows,
   errorRows,
+  dimensionRows,
   isEmpty,
+  labelCircuitRows,
+  labelTotals,
   rangeForPreset,
   retryAfterMinutes,
   successRate,
@@ -44,6 +49,9 @@ let range = rangeForPreset(DEFAULT_PRESET_DAYS, Date.now());
 let preset = DEFAULT_PRESET_DAYS;
 let report = null;
 let circuit = 'all';
+// One label filter at a time: the relay keeps sites and scopes as separate
+// totals, so "this site AND this scope" cannot be answered.
+let labelFilter = null; // { kind: 'origin' | 'scope', key }
 
 function show(el, visible) { el.hidden = !visible; }
 function setText(el, text) { el.textContent = text; }
@@ -191,6 +199,137 @@ function renderCircuitOptions() {
   select.value = circuit;
 }
 
+function renderLabelOptions(kind) {
+  const select = $(`${kind}-select`);
+  const rows = dimensionRows(report, kind);
+  if (labelFilter && labelFilter.kind === kind && !rows.some((r) => r.key === labelFilter.key)) labelFilter = null;
+  select.replaceChildren();
+  const all = document.createElement('option');
+  all.value = 'all';
+  all.textContent = '전체';
+  select.appendChild(all);
+  for (const r of rows) {
+    const o = document.createElement('option');
+    o.value = r.key;
+    o.textContent = r.label;
+    select.appendChild(o);
+  }
+  select.value = labelFilter && labelFilter.kind === kind ? labelFilter.key : 'all';
+}
+
+// The map shapes, fetched once per page load from this origin.
+let world = null;
+let worldLoad = null;
+let selectedCountry = null;
+
+function loadWorld() {
+  worldLoad ??= fetch('/admin/world.json', { credentials: 'omit', referrerPolicy: 'no-referrer' })
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    })
+    .then((data) => {
+      world = data;
+      if (report) render(report);
+    })
+    .catch(() => {
+      worldLoad = null;
+      $('world-map').replaceChildren();
+      const p = document.createElement('p');
+      p.className = 'error small';
+      p.textContent = '지도를 불러오지 못했습니다. 아래 표는 그대로 볼 수 있습니다.';
+      $('world-map').appendChild(p);
+    });
+  return worldLoad;
+}
+
+function selectCountry(code) {
+  selectedCountry = code;
+  if (report) render(report);
+}
+
+function renderCountryDetail() {
+  const box = $('country-detail');
+  box.replaceChildren();
+  if (!selectedCountry) {
+    const p = document.createElement('p');
+    p.className = 'muted small';
+    p.textContent = '지도의 나라나 아래 표의 행을 누르세요.';
+    box.appendChild(p);
+    return;
+  }
+  const d = countryDetail(report, selectedCountry);
+  const h = document.createElement('h3');
+  h.textContent = d.name;
+  box.appendChild(h);
+  const sum = document.createElement('p');
+  sum.textContent = `응답 ${fmt(d.total.answered)} · 완료 ${fmt(d.total.completed)} · 오류 ${fmt(d.total.error)} · 취소 ${fmt(d.total.cancelled)}`;
+  box.appendChild(sum);
+  if (d.circuits.length === 0) {
+    const p = document.createElement('p');
+    p.className = 'muted small';
+    p.textContent = '이 기간에 이 나라에서 온 응답이 없습니다.';
+    box.appendChild(p);
+    return;
+  }
+  const table = document.createElement('table');
+  const head = document.createElement('tr');
+  for (const t of ['회로', '완료', '오류', '취소']) {
+    const th = document.createElement('th');
+    th.scope = 'col';
+    th.textContent = t;
+    head.appendChild(th);
+  }
+  const thead = document.createElement('thead');
+  thead.appendChild(head);
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  for (const r of d.circuits) {
+    const tr = document.createElement('tr');
+    for (const v of [r.circuit, fmt(r.completed), fmt(r.error), fmt(r.cancelled)]) cell(tr, v);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
+function renderMap() {
+  if (!world) {
+    loadWorld();
+    return;
+  }
+  const shades = mapShades(report, circuit);
+  const root = svg('svg', { viewBox: `0 0 ${world.width} ${world.height}`, role: 'group', 'aria-label': '증명을 보낸 국가 지도' });
+  for (const c of world.countries) {
+    const hit = c.code ? shades[c.code] : undefined;
+    const shade = hit ? hit.shade : 0;
+    const path = svg('path', { d: c.d, class: `country shade-${shade}${c.code && c.code === selectedCountry ? ' selected' : ''}` });
+    const label = c.code ? `${countryDetail(report, c.code).name} · 응답 ${fmt(hit ? hit.count : 0)}` : c.name;
+    path.appendChild(svg('title', {}, label));
+    if (c.code) {
+      path.setAttribute('tabindex', hit ? '0' : '-1');
+      path.setAttribute('role', 'button');
+      path.setAttribute('aria-label', label);
+      path.addEventListener('click', () => selectCountry(c.code));
+      path.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          selectCountry(c.code);
+        }
+      });
+    }
+    root.appendChild(path);
+  }
+  $('world-map').replaceChildren(root);
+}
+
+function fillLabelTable(kind, emptyId, columns) {
+  const rows = dimensionRows(report, kind, circuit);
+  show($(emptyId), rows.length === 0);
+  show($(`${kind}-table`), rows.length > 0);
+  fillTable(`${kind}-table`, rows, columns);
+}
+
 function svg(tag, attrs, text) {
   const el = document.createElementNS(SVG_NS, tag);
   for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
@@ -241,6 +380,8 @@ function render(next) {
   setText($('range-label'), `${report.from} ~ ${report.to} (UTC, 양 끝 포함) · 날짜는 모두 UTC 기준`);
   setText($('fetched-at'), `조회 시각 ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`);
   renderCircuitOptions();
+  renderLabelOptions('origin');
+  renderLabelOptions('scope');
 
   const empty = isEmpty(report);
   show($('empty-state'), empty);
@@ -248,8 +389,12 @@ function render(next) {
   if (empty) return;
 
   const days = dailyRows(report, circuit);
-  const rows = circuitRows(report);
-  const selected = circuit === 'all' ? totalsRow(report) : rows.find((r) => r.circuit === circuit);
+  const rows = labelFilter ? labelCircuitRows(report, labelFilter.kind, labelFilter.key) : circuitRows(report);
+  const selected = labelFilter
+    ? labelTotals(report, labelFilter.kind, labelFilter.key, circuit)
+    : circuit === 'all' ? totalsRow(report) : rows.find((r) => r.circuit === circuit);
+  show($('label-filter-note'), Boolean(labelFilter));
+  for (const id of ['chart-panel', 'error-panel', 'day-panel']) show($(id), !labelFilter);
   setText($('tile-requested'), fmt(selected.requested));
   setText($('tile-completed'), fmt(selected.completed));
   setText($('tile-error'), fmt(selected.error));
@@ -258,6 +403,24 @@ function render(next) {
   setText($('tile-rate'), selected.rate);
 
   renderChart(days);
+  const countColumns = [(r) => r.label, (r) => fmt(r.requested), (r) => fmt(r.completed), (r) => fmt(r.error), (r) => fmt(r.cancelled), (r) => fmt(r.expired), (r) => r.rate];
+  fillLabelTable('origin', 'no-origins', countColumns);
+  fillLabelTable('scope', 'no-scopes', countColumns);
+  fillLabelTable('country', 'no-countries', [(r) => r.label, (r) => fmt(r.completed), (r) => fmt(r.error), (r) => fmt(r.cancelled)]);
+  // A country row opens its detail, like a click on the map.
+  const countryRows = dimensionRows(report, 'country', circuit);
+  $('country-table').querySelectorAll('tbody tr').forEach((tr, i) => {
+    const key = countryRows[i].key;
+    if (!key.startsWith('v:')) return;
+    tr.classList.add('clickable');
+    tr.tabIndex = 0;
+    const open = () => selectCountry(decodeURIComponent(key.slice(2)));
+    tr.addEventListener('click', open);
+    tr.addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });
+  });
+  renderMap();
+  renderCountryDetail();
+
   fillTable('circuit-table', rows, [(r) => r.circuit, (r) => fmt(r.requested), (r) => fmt(r.completed), (r) => fmt(r.error), (r) => fmt(r.cancelled), (r) => fmt(r.expired), (r) => r.rate]);
 
   const errors = errorRows(report, circuit);
@@ -294,6 +457,13 @@ function init() {
     circuit = $('circuit-select').value;
     if (report) render(report);
   });
+  for (const kind of ['origin', 'scope']) {
+    $(`${kind}-select`).addEventListener('change', () => {
+      const key = $(`${kind}-select`).value;
+      labelFilter = key === 'all' ? null : { kind, key };
+      if (report) render(report);
+    });
+  }
 
   syncControls();
   const saved = readToken();

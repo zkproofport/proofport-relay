@@ -90,8 +90,8 @@ export class Lifecycle {
   }
 
   /** Records a new pending request and starts its deadline. */
-  async open(status: ProofStatus, circuitId: string, now: number): Promise<RequestMeta> {
-    const meta: RequestMeta = { circuitId, deadlineAt: now + this.deadlineMs };
+  async open(status: ProofStatus, circuitId: string, now: number, labels?: RequestMeta['labels']): Promise<RequestMeta> {
+    const meta: RequestMeta = { circuitId, deadlineAt: now + this.deadlineMs, ...(labels && { labels }) };
     await this.redis
       .multi()
       .set(statusKey(status.requestId), JSON.stringify(status), 'EX', STATUS_TTL_SECONDS)

@@ -45,7 +45,14 @@
         <label class="circuit-filter">회로
           <select id="circuit-select"><option value="all">전체</option></select>
         </label>
+        <label class="circuit-filter">요청한 사이트
+          <select id="origin-select"><option value="all">전체</option></select>
+        </label>
+        <label class="circuit-filter">scope
+          <select id="scope-select"><option value="all">전체</option></select>
+        </label>
       </div>
+      <p id="label-filter-note" class="muted small" hidden>사이트나 scope를 고르면 합계와 회로별 표만 그 값으로 걸러집니다. 일별·오류 코드별 기록은 사이트와 scope로 나뉘어 저장되지 않아 숨깁니다.</p>
 
       <p id="range-label" class="muted"></p>
       <p id="dashboard-error" class="error" role="alert" hidden></p>
@@ -65,7 +72,7 @@
           <div class="tile"><span class="tile-label">성공률</span><span class="tile-value" id="tile-rate"></span></div>
         </section>
 
-        <section class="panel">
+        <section class="panel" id="chart-panel">
           <h2>일별 요청 · 완료 (UTC)</h2>
           <ul class="legend">
             <li><span class="swatch swatch-requested"></span>요청</li>
@@ -86,6 +93,56 @@
         </section>
 
         <section class="panel">
+          <h2>요청한 사이트별</h2>
+          <p class="muted small">브라우저가 붙인 출처(Origin)의 호스트입니다. 서버나 앱에서 보낸 요청은 출처가 없거나 임의의 값일 수 있습니다.</p>
+          <p id="no-origins" class="muted" hidden>기록이 없습니다.</p>
+          <div class="table-wrap">
+            <table id="origin-table">
+              <thead><tr><th scope="col">사이트</th><th scope="col">요청</th><th scope="col">완료</th><th scope="col">오류</th><th scope="col">취소</th><th scope="col">만료</th><th scope="col">성공률</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>scope별</h2>
+          <p class="muted small">요청에 함께 보낸 scope 값입니다(증명 입력값 안의 scope는 읽지 않습니다).</p>
+          <p id="no-scopes" class="muted" hidden>기록이 없습니다.</p>
+          <div class="table-wrap">
+            <table id="scope-table">
+              <thead><tr><th scope="col">scope</th><th scope="col">요청</th><th scope="col">완료</th><th scope="col">오류</th><th scope="col">취소</th><th scope="col">만료</th><th scope="col">성공률</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>증명을 보낸 국가별</h2>
+          <p class="muted small">앱이 결과를 보낸 접속 위치의 국가입니다. IP는 저장하지 않습니다. 앱이 응답하지 않은 만료 건은 위치가 없어 빠집니다. 나라를 누르면 회로별 상세가 나옵니다.</p>
+          <div class="map-layout">
+            <div id="world-map" class="world-map"><p class="muted small">지도를 불러오는 중…</p></div>
+            <aside id="country-detail" class="country-detail" aria-live="polite">
+              <p class="muted small">지도의 나라나 아래 표의 행을 누르세요.</p>
+            </aside>
+          </div>
+          <ul class="legend map-legend" aria-label="색이 진할수록 응답이 많음">
+            <li><span class="swatch shade-0"></span>0</li>
+            <li><span class="swatch shade-1"></span></li>
+            <li><span class="swatch shade-2"></span></li>
+            <li><span class="swatch shade-3"></span></li>
+            <li><span class="swatch shade-4"></span></li>
+            <li><span class="swatch shade-5"></span>많음</li>
+          </ul>
+          <p id="no-countries" class="muted" hidden>기록이 없습니다.</p>
+          <div class="table-wrap">
+            <table id="country-table">
+              <thead><tr><th scope="col">국가</th><th scope="col">완료</th><th scope="col">오류</th><th scope="col">취소</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" id="error-panel">
           <h2>오류 코드별</h2>
           <p id="no-errors" class="muted" hidden>이 기간에 오류가 없습니다.</p>
           <div class="table-wrap">
@@ -96,7 +153,7 @@
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel" id="day-panel">
           <h2>일별 (UTC)</h2>
           <div class="table-wrap">
             <table id="day-table">

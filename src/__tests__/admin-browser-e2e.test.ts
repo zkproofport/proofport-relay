@@ -101,6 +101,113 @@ afterAll(async () => {
   await browser?.close();
 });
 
+async function labelledRequest(origin: string, scope: string): Promise<string> {
+  const h = { 'X-Forwarded-For': API_IP };
+  const ch = await (await fetch(`${A}/api/v1/challenge`, { headers: h })).json() as { requestId: string; challenge: string };
+  const res = await fetch(`${A}/api/v1/proof/request`, {
+    method: 'POST',
+    headers: { ...h, 'Content-Type': 'application/json', Origin: origin },
+    body: JSON.stringify({ requestId: ch.requestId, challenge: ch.challenge, circuitId: CIRCUIT, inputs: {}, scope }),
+  });
+  expect(res.status).toBe(201);
+  return ch.requestId;
+}
+
+async function answerFrom(requestId: string, status: string, region: string) {
+  const res = await fetch(`${A}/api/v1/proof/callback`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Relay-Client-Region': region },
+    body: JSON.stringify({ requestId, status, circuit: CIRCUIT, ...(status === 'error' && { errorCode: 'E2005' }) }),
+  });
+  expect(res.status).toBe(200);
+}
+
+describe('sites, scopes and the country map in a browser', () => {
+  it('filters by site, colours the map and opens a country on click', async () => {
+    const run = `${Date.now()}`;
+    const origin = `https://map-${run}.example`;
+    const host = new URL(origin).host;
+    const scope = `map-scope-${run}`;
+    const ids = await Promise.all([labelledRequest(origin, scope), labelledRequest(origin, scope), labelledRequest(origin, scope)]);
+    await answerFrom(ids[0], 'completed', 'KR');
+    await answerFrom(ids[1], 'error', 'KR');
+    await answerFrom(ids[2], 'cancelled', 'NZ');
+    await new Promise((r) => setTimeout(r, 300));
+
+    const { context, page, cspErrors, pageErrors } = await newPage();
+    await login(page, TOKEN);
+    await page.locator('#content').waitFor({ state: 'visible' });
+
+    // The site and scope tables list them as text.
+    const siteRow = page.locator('#origin-table tbody tr', { has: page.locator('td:first-child', { hasText: new RegExp(`^${host.replace(/\./g, '\\.')}$`) }) });
+    expect((await siteRow.locator('td').allTextContents()).slice(1, 5)).toEqual(['3', '1', '1', '1']);
+    expect(await page.locator('#scope-table tbody td:first-child', { hasText: scope }).count()).toBe(1);
+
+    // Filtering by the site: tiles show only its numbers; per-day panels hide.
+    await page.selectOption('#origin-select', `v:${encodeURIComponent(host)}`);
+    expect(await page.textContent('#tile-requested')).toBe('3');
+    expect(await page.textContent('#tile-completed')).toBe('1');
+    expect(await page.isVisible('#label-filter-note')).toBe(true);
+    expect(await page.isVisible('#chart-panel')).toBe(false);
+    expect(await page.isVisible('#day-panel')).toBe(false);
+    await shot(page, '07-filtered-by-site');
+    await page.selectOption('#origin-select', 'all');
+    expect(await page.isVisible('#chart-panel')).toBe(true);
+
+    // The map: shapes from /admin/world.json, Korea shaded, clickable.
+    await page.locator('#world-map svg path.country').first().waitFor();
+    expect(await page.locator('#world-map svg path.country').count()).toBeGreaterThan(150);
+    const kr = page.locator('#world-map svg path.country[aria-label^="대한민국"]');
+    expect(await kr.count()).toBe(1);
+    expect(await kr.getAttribute('class')).toMatch(/shade-[1-5]/);
+    await kr.click();
+    await expect.poll(async () => page.textContent('#country-detail h3')).toBe('대한민국 (KR)');
+    const detailRow = page.locator('#country-detail tbody tr', { hasText: CIRCUIT });
+    expect(Number((await detailRow.locator('td').nth(1).textContent())!.replace(/,/g, ''))).toBeGreaterThanOrEqual(1);
+    expect(await kr.getAttribute('class')).toContain('selected');
+    await shot(page, '08-map-korea-selected');
+
+    // A country row opens the same detail; keyboard works on the map too.
+    await page.locator('#country-table tbody tr', { hasText: '뉴질랜드' }).click();
+    await expect.poll(async () => page.textContent('#country-detail h3')).toBe('뉴질랜드 (NZ)');
+    await page.locator('#world-map svg path.country[aria-label^="대한민국"]').focus();
+    await page.keyboard.press('Enter');
+    await expect.poll(async () => page.textContent('#country-detail h3')).toBe('대한민국 (KR)');
+
+    expect(cspErrors).toEqual([]);
+    expect(pageErrors).toEqual([]);
+    await context.close();
+  });
+
+  it('a hostile site, scope or country value is shown as text and never runs', async () => {
+    const key = (kind: string) => `relay:stats:dim:${kind}:${XSS_DAY}`;
+    const evil = '<img src=x onerror="window.__xss=1">';
+    await redis.hset(key('scope'), `v:${encodeURIComponent(evil)}|${CIRCUIT}|requested`, '1');
+    await redis.hset(key('origin'), `v:${encodeURIComponent(evil)}|${CIRCUIT}|requested`, '1');
+    await redis.hset(key('country'), `v:${encodeURIComponent(evil)}|${CIRCUIT}|completed`, '1');
+    await redis.hset(`relay:stats:${XSS_DAY}`, `${CIRCUIT}|requested`, '1');
+    for (const k of ['scope', 'origin', 'country']) await redis.expire(key(k), 600);
+    await redis.expire(`relay:stats:${XSS_DAY}`, 600);
+    const { context, page, pageErrors } = await newPage();
+    await login(page, TOKEN);
+    await page.locator('#content').waitFor({ state: 'visible' });
+    await page.fill('#from-input', XSS_DAY);
+    await page.fill('#to-input', XSS_DAY);
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes(`from=${XSS_DAY}&to=${XSS_DAY}`)),
+      page.click('#range-form button[type="submit"]'),
+    ]);
+    await expect.poll(async () => page.textContent('#scope-table tbody td:first-child')).toBe(evil);
+    expect(await page.textContent('#origin-table tbody td:first-child')).toBe(evil);
+    expect(await page.locator('#origin-select option', { hasText: evil }).count()).toBe(1);
+    expect(await page.locator('img').count()).toBe(0);
+    expect(await page.evaluate(() => (globalThis as unknown as { __xss?: number }).__xss)).toBeUndefined();
+    expect(pageErrors).toEqual([]);
+    for (const k of ['scope', 'origin', 'country']) await redis.del(key(k));
+    await context.close();
+  });
+});
+
 describe('admin dashboard in a browser', () => {
   it('wrong token: error shown, still on the login view, nothing stored', async () => {
     const { context, page, cspErrors, pageErrors } = await newPage();

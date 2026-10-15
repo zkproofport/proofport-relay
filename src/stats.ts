@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'crypto';
 import type Redis from 'ioredis';
 import { scrubError } from './mask';
+import { decodeLabel, DIMENSIONS, Dimension, MARKERS, Marker } from './labels';
 
 /**
  * Per-circuit request statistics, one Redis hash per UTC day.
@@ -16,7 +17,18 @@ import { scrubError } from './mask';
  *   <circuit>|cancelled
  *   <circuit>|expired
  *
- * Nothing else is stored: no IP, wallet, requestId, scope or nullifier. A
+ * Split by label (labels.ts), one Redis hash per label kind per UTC day under
+ * `relay:stats:dim:<origin|scope|country>:YYYY-MM-DD`, fields
+ * `<label>|<circuit>|<requested|completed|error|cancelled|expired>`:
+ *   origin and scope   recorded when the request is created and again at its
+ *                      terminal outcome, from what was recorded at creation
+ *   country            recorded only for answers the app sent (completed,
+ *                      error, cancelled): it is where the callback came from
+ * At most DIMENSION_MAX_VALUES_PER_DAY distinct labels per kind per day; the
+ * rest are counted under `m:other`, so a caller sending a new value on every
+ * request cannot grow the store without bound.
+ *
+ * Nothing else is stored: no IP, wallet, requestId or nullifier. A
  * timeout (`expired`) is its own field so it can be told apart, and is grouped
  * with `cancelled` when the two are read together (see `abandoned` below).
  *
@@ -35,6 +47,40 @@ export type TerminalOutcome = 'completed' | 'error' | 'cancelled' | 'expired';
 export type StatsOutcome = 'requested' | TerminalOutcome;
 
 export const ERROR_CODE_RE = /^E\d{4}$/;
+
+/** Distinct labels kept per kind per day before the rest become `m:other`. */
+export const DIMENSION_MAX_VALUES_PER_DAY = 500;
+
+export type StatsLabels = Partial<Record<Dimension, string>>;
+
+export function dimensionKey(kind: Dimension, day: string): string {
+  return `${STATS_KEY_PREFIX}dim:${kind}:${day}`;
+}
+
+export function dimensionSeenKey(kind: Dimension, day: string): string {
+  return `${STATS_KEY_PREFIX}dim-seen:${kind}:${day}`;
+}
+
+/**
+ * KEYS: dimension hash, seen set
+ * ARGV: label, "<circuit>|<outcome>", cap, ttl, overflow label
+ * One script so two instances seeing their first new label at the same moment
+ * cannot both slip past the cap.
+ */
+export const DIMENSION_LUA = `
+local label = ARGV[1]
+if redis.call('SISMEMBER', KEYS[2], label) == 0 then
+  if redis.call('SCARD', KEYS[2]) >= tonumber(ARGV[3]) then
+    label = ARGV[5]
+  else
+    redis.call('SADD', KEYS[2], label)
+  end
+end
+redis.call('EXPIRE', KEYS[2], ARGV[4])
+redis.call('HINCRBY', KEYS[1], label .. '|' .. ARGV[2], 1)
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return 1
+`;
 const NO_ERROR_CODE = 'none';
 
 /** The UTC calendar day of an instant, `YYYY-MM-DD`. */
@@ -60,12 +106,12 @@ export interface StatsRecorder {
    * promise the caller could wait on, so a Redis failure while counting can
    * neither fail nor delay the proof path. Failures are logged and dropped.
    */
-  record(circuit: string, outcome: StatsOutcome, errorCode?: string, at?: Date): void;
+  record(circuit: string, outcome: StatsOutcome, errorCode?: string, at?: Date, labels?: StatsLabels): void;
 }
 
 export function createStatsRecorder(redis: Redis, log: (line: string) => void = console.error): StatsRecorder {
   return {
-    record(circuit, outcome, errorCode, at = new Date()) {
+    record(circuit, outcome, errorCode, at = new Date(), labels = {}) {
       let field: string;
       try {
         field = statsField(circuit, outcome, errorCode);
@@ -73,12 +119,19 @@ export function createStatsRecorder(redis: Redis, log: (line: string) => void = 
         log(`[Relay Stats] Not counted: ${scrubError(err)}`);
         return;
       }
-      const key = statsKey(utcDay(at));
+      const day = utcDay(at);
+      const key = statsKey(day);
       try {
-        redis
-          .multi()
-          .hincrby(key, field, 1)
-          .expire(key, STATS_TTL_SECONDS)
+        const tx = redis.multi().hincrby(key, field, 1).expire(key, STATS_TTL_SECONDS);
+        for (const kind of DIMENSIONS) {
+          const label = labels[kind];
+          if (label === undefined) continue;
+          tx.eval(
+            DIMENSION_LUA, 2, dimensionKey(kind, day), dimensionSeenKey(kind, day),
+            label, `${circuit}|${outcome}`, DIMENSION_MAX_VALUES_PER_DAY, STATS_TTL_SECONDS, MARKERS.other,
+          );
+        }
+        tx
           .exec()
           .then((replies) => {
             const failed = replies?.find(([e]) => e);
@@ -111,13 +164,55 @@ export interface DayStats {
   circuits: Record<string, CircuitCounts>;
 }
 
+/** Outcomes per label. Errors are not split by code here; the circuit view has that. */
+export interface OutcomeCounts {
+  requested: number;
+  completed: number;
+  error: number;
+  cancelled: number;
+  expired: number;
+  abandoned: number;
+}
+
+export interface DimensionRow {
+  /** The value as sent, or null for a marker. */
+  value: string | null;
+  /** none, invalid, too-long, unknown or other; null for a value. */
+  marker: Marker | null;
+  circuits: Record<string, OutcomeCounts>;
+  all: OutcomeCounts;
+}
+
 export interface StatsReport {
   from: string;
   to: string;
   days: DayStats[];
   totals: { circuits: Record<string, CircuitCounts>; all: CircuitCounts };
+  /** Range totals per label kind, keyed by the stored label. */
+  dimensions: Record<Dimension, Record<string, DimensionRow>>;
   /** Hash fields this reader does not understand, so nothing is silently dropped. */
   unrecognized: Record<string, number>;
+}
+
+function emptyOutcomes(): OutcomeCounts {
+  return { requested: 0, completed: 0, error: 0, cancelled: 0, expired: 0, abandoned: 0 };
+}
+
+const DIMENSION_OUTCOMES: readonly StatsOutcome[] = ['requested', 'completed', 'error', 'cancelled', 'expired'];
+
+/** Applies one dimension hash field. False when the field is not one this module writes. */
+function applyDimensionField(rows: Record<string, DimensionRow>, field: string, n: number): boolean {
+  const parts = field.split('|');
+  if (parts.length !== 3) return false;
+  const [label, circuit, outcome] = parts;
+  const decoded = decodeLabel(label);
+  if (!decoded || !circuit || !(DIMENSION_OUTCOMES as readonly string[]).includes(outcome)) return false;
+  const row = (rows[label] ??= { value: decoded.value, marker: decoded.marker, circuits: {}, all: emptyOutcomes() } as DimensionRow);
+  for (const target of [(row.circuits[circuit] ??= emptyOutcomes()), row.all]) {
+    target[outcome as StatsOutcome] += n;
+    if (outcome === 'cancelled' || outcome === 'expired') target.abandoned += n;
+  }
+  return true;
 }
 
 function emptyCounts(): CircuitCounts {
@@ -194,6 +289,7 @@ export function checkRange(from: unknown, to: unknown): RangeCheck {
 export async function readStats(redis: Redis, days: string[]): Promise<StatsReport> {
   const pipeline = redis.pipeline();
   for (const day of days) pipeline.hgetall(statsKey(day));
+  for (const kind of DIMENSIONS) for (const day of days) pipeline.hgetall(dimensionKey(kind, day));
   const replies = (await pipeline.exec()) ?? [];
 
   const report: StatsReport = {
@@ -201,6 +297,7 @@ export async function readStats(redis: Redis, days: string[]): Promise<StatsRepo
     to: days[days.length - 1],
     days: [],
     totals: { circuits: {}, all: emptyCounts() },
+    dimensions: { origin: {}, scope: {}, country: {} },
     unrecognized: {},
   };
 
@@ -219,6 +316,19 @@ export async function readStats(redis: Redis, days: string[]): Promise<StatsRepo
       addInto(report.totals.all, counts);
     }
     report.days.push({ date, circuits });
+  });
+
+  DIMENSIONS.forEach((kind, k) => {
+    days.forEach((date, i) => {
+      const [err, hash] = replies[days.length * (k + 1) + i] ?? [new Error('no reply'), null];
+      if (err) throw err;
+      for (const [field, raw] of Object.entries((hash ?? {}) as Record<string, string>)) {
+        const n = Number(raw);
+        if (!Number.isFinite(n) || !applyDimensionField(report.dimensions[kind], field, n)) {
+          report.unrecognized[`${date}:${kind}:${field}`] = Number.isFinite(n) ? n : 0;
+        }
+      }
+    });
   });
 
   return report;

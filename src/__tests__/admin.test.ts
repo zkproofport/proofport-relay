@@ -14,6 +14,7 @@ import path from 'path';
 import express from 'express';
 import type Redis from 'ioredis';
 import { createRelay, Relay } from '../app';
+import { EDGES } from '../edge';
 import { ADMIN_ASSETS, ADMIN_DIR, ADMIN_SECURITY_HEADERS, loadAdminAssets, mountAdmin } from '../admin';
 import type { StatsAuthGuard } from '../statsAuth';
 
@@ -40,6 +41,7 @@ async function startRelay(opts: { statsAuth?: StatsAuthGuard } = {}): Promise<{ 
     statsToken: TOKEN,
     statsAuth: opts.statsAuth ?? { lockedFor: async () => 0, recordFailure: async () => 1 },
     adapter: null,
+    edge: EDGES.local,
     relayExternalUrl: '',
     port: 0,
     deadlineMs: 3_600_000,

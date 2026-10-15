@@ -94,6 +94,7 @@ Environment variables (see `.env.example`):
 | `REDIS_URL` | (required) | Redis connection string |
 | `RELAY_EXTERNAL_URL` | (required for production) | External relay URL for deep link callbacks |
 | `RELAY_STATS_TOKEN` | (required, ≥ 32 chars) | Bearer token for `GET /api/v1/stats`. The relay refuses to start without it. Locally `scripts/dev.sh` generates one into `.env.development`; deployed environments read the Google Secret Manager secrets `relay-stats-token-staging` / `relay-stats-token-production` (mounted by `deploy.yml` with `--set-secrets`; GitHub secrets are write-only, so the token could never be read back to call the API) |
+| `RELAY_EDGE` | (required) | What sits in front of the relay (`src/edge.ts`): `cloud-run-domain` (Cloud Run domain mapping, 1 proxy hop, no country), `load-balancer` (external Application Load Balancer, 2 hops, country from `X-Relay-Client-Region`), `local` (Docker, 1 hop, headers believed for tests). Decides which `X-Forwarded-For` entry is the caller and whether the country header is trusted |
 | `NODE_ENV` | `development` | Environment mode |
 
 ## API Reference
@@ -298,7 +299,13 @@ Receive proof completion callback from mobile app.
 - Statistics use the circuit recorded when the request was created, not the `circuit` the callback claims
 
 #### GET /api/v1/stats
-Per-circuit request statistics, per UTC day. `Authorization: Bearer <RELAY_STATS_TOKEN>` is required (401 otherwise, checked before anything else). The comparison is constant-time.
+Per-circuit request statistics, per UTC day, plus range totals split by label in `dimensions`:
+
+- `origin` -- host of the browser `Origin` header that created the request (`m:none` when absent or `null`, `m:invalid` for a non-http(s) origin)
+- `scope` -- the top-level `scope` field of the request body (the relay never reads `inputs`)
+- `country` -- the country the app's callback came from, as the relay's load balancer resolved it (`X-Relay-Client-Region`); only answers from the app (completed, error, cancelled), never expiry, and only when `RELAY_EDGE` trusts the header
+
+Each is `{ "<label>": { value, marker, circuits: { <circuit>: {requested, completed, error, cancelled, expired, abandoned} }, all } }`, where the label is `v:<encodeURIComponent(value)>` or a marker `m:none|invalid|too-long|unknown|other`. At most 500 distinct labels per kind per day; the rest are counted as `m:other`. No IP address is stored. `Authorization: Bearer <RELAY_STATS_TOKEN>` is required (401 otherwise, checked before anything else). The comparison is constant-time.
 
 - **Same origin only.** No CORS headers, although every public path allows any origin: a browser on another origin cannot call it, token or not. The admin page (`/admin`) is same-origin.
 - **Wrong-token lockout.** 10 wrong or missing tokens from one caller within 15 minutes, and every stats call from that caller answers **429** with `Retry-After` until the window ends -- the right token included. Counted in Redis (`relay:stats-auth-fail:<sha256 of the address>`, 15-minute TTL), so it holds across all Cloud Run instances; the address itself is never stored.

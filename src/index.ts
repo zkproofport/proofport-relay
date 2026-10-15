@@ -3,6 +3,7 @@ import Redis from 'ioredis';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { createRelay, REQUEST_DEADLINE_MS, SWEEP_INTERVAL_MS } from './app';
 import { createStatsRecorder } from './stats';
+import { edgeFor } from './edge';
 import { scrubError, scrubText } from './mask';
 
 dotenv.config();
@@ -30,6 +31,9 @@ if (!RELAY_STATS_TOKEN) throw new Error('RELAY_STATS_TOKEN environment variable 
 if (RELAY_STATS_TOKEN.length < 32) {
   throw new Error(`RELAY_STATS_TOKEN must be at least 32 characters (got ${RELAY_STATS_TOKEN.length}); generate one with: openssl rand -hex 32`);
 }
+
+/** What sits in front of the relay; see edge.ts. Required, no default. */
+const EDGE = edgeFor(process.env.RELAY_EDGE);
 
 if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.RELAY_EXTERNAL_URL) {
   throw new Error('RELAY_EXTERNAL_URL environment variable is required in production/staging');
@@ -65,6 +69,7 @@ async function main() {
     // Without an adapter an emit only reaches sockets on THIS instance. Cloud
     // Run runs up to 20, and the app's callback lands on any of them.
     adapter: createAdapter(pub, sub),
+    edge: EDGE,
     relayExternalUrl: RELAY_EXTERNAL_URL,
     port: PORT,
     deadlineMs: REQUEST_DEADLINE_MS,
@@ -74,6 +79,7 @@ async function main() {
   relay.httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[Relay] Server running on port ${PORT}`);
     console.log(`[Relay] Socket.IO namespace: /proof (Redis adapter)`);
+    console.log(`[Relay] Edge: RELAY_EDGE=${process.env.RELAY_EDGE} (proxy hops ${EDGE.proxyHops}, country header ${EDGE.regionHeader ?? 'none'})`);
     console.log(`[Relay] Request deadline ${REQUEST_DEADLINE_MS}ms, sweep every ${SWEEP_INTERVAL_MS}ms`);
   });
 }

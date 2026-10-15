@@ -12,6 +12,7 @@ import type { AddressInfo } from 'net';
 import Redis from 'ioredis';
 import { io as connectSocket, Socket as ClientSocket } from 'socket.io-client';
 import { createRelay, Relay } from '../app';
+import { EDGES } from '../edge';
 import { createStatsRecorder } from '../stats';
 import { STATS_AUTH_KEY_PREFIX, STATS_AUTH_MAX_FAILURES, STATS_AUTH_WINDOW_SECONDS, statsAuthKey } from '../statsAuth';
 
@@ -52,6 +53,7 @@ async function start(): Promise<string> {
     stats: createStatsRecorder(redis),
     statsToken: TOKEN,
     adapter: null,
+    edge: EDGES.local,
     relayExternalUrl: '',
     port: 0,
     deadlineMs: LONG,

@@ -12,7 +12,8 @@ import { ethers } from 'ethers';
 import { io as connectSocket, Socket as ClientSocket } from 'socket.io-client';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { createRelay, ERROR_MESSAGE_MAX_CHARS, EXPIRED_MESSAGE, Relay } from '../app';
-import { createStatsRecorder, readStats, StatsRecorder, utcDay } from '../stats';
+import { EDGES } from '../edge';
+import { createStatsRecorder, DIMENSION_MAX_VALUES_PER_DAY, readStats, StatsRecorder, utcDay } from '../stats';
 import { DEADLINES_KEY, metaKey, TERMINAL_TTL_SECONDS } from '../lifecycle';
 
 const REDIS_TEST_URL = process.env.REDIS_TEST_URL;
@@ -55,6 +56,7 @@ async function start(opts: {
   sweepIntervalMs?: number;
   adapterKey?: string;
   stats?: StatsRecorder;
+  edge?: (typeof EDGES)[keyof typeof EDGES];
 } = {}): Promise<Started> {
   const clients: Redis[] = [];
   let adapter = null;
@@ -69,6 +71,7 @@ async function start(opts: {
     stats: opts.stats ?? createStatsRecorder(redis),
     statsToken: STATS_TOKEN,
     adapter,
+    edge: opts.edge ?? EDGES.local,
     relayExternalUrl: '',
     port: 0,
     deadlineMs: opts.deadlineMs ?? LONG,
@@ -520,8 +523,11 @@ describe('statistics never block the proof path', () => {
     const { url } = await start({ stats: hanging });
     const { requestId } = await createRequest(url);
     expect((await callback(url, { requestId, status: 'cancelled' })).status).toBe(200);
-    expect(hanging.record).toHaveBeenCalledWith('coinbase_attestation', 'requested');
-    expect(hanging.record).toHaveBeenCalledWith('coinbase_attestation', 'cancelled', undefined);
+    // Server-side fetch sends no Origin and this request has no envelope scope.
+    const labels = { origin: 'm:none', scope: 'm:none' };
+    expect(hanging.record).toHaveBeenCalledWith('coinbase_attestation', 'requested', undefined, undefined, labels);
+    // The answer carries the request's labels plus where it came from (no header -> none).
+    expect(hanging.record).toHaveBeenCalledWith('coinbase_attestation', 'cancelled', undefined, undefined, { ...labels, country: 'm:none' });
   });
 });
 
@@ -641,5 +647,163 @@ describe('log masking across a full lifecycle', () => {
     } finally {
       for (const s of spies) s.mockRestore();
     }
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Labels: which page asked, the envelope scope, where the app answered from
+// ---------------------------------------------------------------------------
+describe('stats by site, scope and country', () => {
+  const today = () => utcDay(new Date());
+
+  async function labelledRequest(url: string, opts: { origin?: string; scope?: unknown; xff: string }) {
+    const ch = await (await fetch(`${url}/api/v1/challenge`, { headers: { 'X-Forwarded-For': opts.xff } })).json() as { requestId: string; challenge: string };
+    const signature = await wallet.signMessage(ch.challenge);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json', 'X-Forwarded-For': opts.xff };
+    if (opts.origin !== undefined) headers.Origin = opts.origin;
+    const res = await fetch(`${url}/api/v1/proof/request`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        requestId: ch.requestId, challenge: ch.challenge, signature, circuitId: 'coinbase_attestation',
+        inputs: { scope: 'inside-inputs-never-read' },
+        ...(opts.scope !== undefined && { scope: opts.scope }),
+      }),
+    });
+    expect(res.status).toBe(201);
+    return ch.requestId;
+  }
+
+  async function answer(url: string, requestId: string, status: string, region?: string) {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (region !== undefined) headers['X-Relay-Client-Region'] = region;
+    const res = await fetch(`${url}/api/v1/proof/callback`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ requestId, status, circuit: 'coinbase_attestation', ...(status === 'error' && { errorCode: 'E2005' }) }),
+    });
+    expect(res.status).toBe(200);
+  }
+
+  async function dims() {
+    return (await readStats(redis, [today()])).dimensions;
+  }
+
+  it('a request and its answer land under the page that asked, the envelope scope and the answering country', async () => {
+    await redis.flushdb();
+    const { url } = await start();
+    const id = await labelledRequest(url, { origin: 'https://DojangScan.com', scope: 'dojang-v1', xff: '198.51.100.1' });
+    await answer(url, id, 'completed', 'KR');
+    await until(async () => (await dims()).country['v:KR']?.all.completed === 1);
+    const d = await dims();
+    expect(d.origin['v:dojangscan.com'].circuits.coinbase_attestation).toMatchObject({ requested: 1, completed: 1 });
+    expect(d.scope['v:dojang-v1'].all).toMatchObject({ requested: 1, completed: 1 });
+    // The scope inside the proof inputs is never read.
+    expect(Object.keys(d.scope)).toEqual(['v:dojang-v1']);
+    expect(d.country['v:KR'].all).toMatchObject({ requested: 0, completed: 1 });
+  });
+
+  it('no Origin and no envelope scope are counted as "none"; an error answer as error, under its country', async () => {
+    await redis.flushdb();
+    const { url } = await start();
+    const id = await labelledRequest(url, { xff: '198.51.100.2' });
+    await answer(url, id, 'error', 'US');
+    await until(async () => (await dims()).country['v:US']?.all.error === 1);
+    const d = await dims();
+    expect(d.origin['m:none'].all).toMatchObject({ requested: 1, error: 1 });
+    expect(d.scope['m:none'].all).toMatchObject({ requested: 1, error: 1 });
+  });
+
+  it('a country the load balancer could not place, and a forged value, are not counted as a country', async () => {
+    await redis.flushdb();
+    const { url } = await start();
+    const a = await labelledRequest(url, { origin: 'https://a.example', xff: '198.51.100.3' });
+    const b = await labelledRequest(url, { origin: 'https://a.example', xff: '198.51.100.3' });
+    await answer(url, a, 'cancelled', '');
+    await answer(url, b, 'cancelled', 'KR,US');
+    await until(async () => (await dims()).origin['v:a.example']?.all.cancelled === 2);
+    const d = await dims();
+    expect(d.country['m:unknown'].all.cancelled).toBe(1);
+    expect(d.country['m:invalid'].all.cancelled).toBe(1);
+  });
+
+  it('behind a Cloud Run domain mapping the country header is not trusted at all', async () => {
+    await redis.flushdb();
+    const { url } = await start({ edge: EDGES['cloud-run-domain'] });
+    const id = await labelledRequest(url, { origin: 'https://a.example', xff: '198.51.100.4' });
+    await answer(url, id, 'completed', 'KR');
+    await until(async () => (await dims()).origin['v:a.example']?.all.completed === 1);
+    expect((await dims()).country).toEqual({});
+  });
+
+  it('an expiry keeps the site and scope of its request and has no country', async () => {
+    await redis.flushdb();
+    const { url, relay } = await start({ deadlineMs: 50 });
+    await labelledRequest(url, { origin: 'https://slow.example', scope: 's', xff: '198.51.100.5' });
+    await new Promise((r) => setTimeout(r, 120));
+    await relay.sweep();
+    await until(async () => (await dims()).origin['v:slow.example']?.all.expired === 1);
+    const d = await dims();
+    expect(d.scope['v:s'].all).toMatchObject({ requested: 1, expired: 1, abandoned: 1 });
+    expect(d.country).toEqual({});
+  });
+
+  it('a request over Socket.IO is labelled by its handshake Origin', async () => {
+    await redis.flushdb();
+    const { url } = await start();
+    const ch = await (await fetch(`${url}/api/v1/challenge`, { headers: { 'X-Forwarded-For': '198.51.100.6' } })).json() as { requestId: string; challenge: string };
+    const socket = connectSocket(`${url}/proof`, {
+      path: '/socket.io', transports: ['websocket'], forceNew: true, extraHeaders: { Origin: 'https://socket.example' },
+    });
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect_error', reject);
+      socket.once('proof:status', () => resolve());
+      socket.once('proof:error', (e) => reject(new Error(JSON.stringify(e))));
+      socket.on('connect', async () => socket.emit('proof:request', {
+        requestId: ch.requestId, challenge: ch.challenge, signature: await wallet.signMessage(ch.challenge),
+        circuitId: 'coinbase_attestation', inputs: { scope: 'x' },
+      }));
+    });
+    await until(async () => (await dims()).origin['v:socket.example']?.all.requested === 1);
+  });
+
+  it('the sites add up to the circuit totals, request for request', async () => {
+    await redis.flushdb();
+    const { url } = await start();
+    const origins = ['https://a.example', 'https://b.example', undefined, 'null', 'chrome-extension://x'];
+    for (const [i, origin] of origins.entries()) await labelledRequest(url, { origin, xff: `198.51.100.${10 + i}` });
+    await until(async () => {
+      const r = await readStats(redis, [today()]);
+      return Object.values(r.dimensions.origin).reduce((n, row) => n + row.all.requested, 0) === origins.length;
+    });
+    const r = await readStats(redis, [today()]);
+    const sum = Object.values(r.dimensions.origin).reduce((n, row) => n + row.all.requested, 0);
+    expect(sum).toBe(r.totals.all.requested);
+    expect(r.dimensions.origin['m:none'].all.requested).toBe(2);
+    expect(r.dimensions.origin['m:invalid'].all.requested).toBe(1);
+  });
+
+  it(`at most ${DIMENSION_MAX_VALUES_PER_DAY} distinct values a day, even written at once from two relays; the rest is "other"`, async () => {
+    await redis.flushdb();
+    const second = new Redis(REDIS_TEST_URL!);
+    const recorders = [createStatsRecorder(redis), createStatsRecorder(second)];
+    const extra = 37;
+    const total = DIMENSION_MAX_VALUES_PER_DAY + extra;
+    for (let i = 0; i < total; i++) recorders[i % 2].record('coinbase_attestation', 'requested', undefined, undefined, { scope: `v:s${i}` });
+    await until(async () => {
+      const r = await readStats(redis, [today()]);
+      return Object.values(r.dimensions.scope).reduce((n, row) => n + row.all.requested, 0) === total;
+    }, 10_000);
+    const r = await readStats(redis, [today()]);
+    const values = Object.keys(r.dimensions.scope).filter((k) => k.startsWith('v:'));
+    expect(values).toHaveLength(DIMENSION_MAX_VALUES_PER_DAY);
+    expect(r.dimensions.scope['m:other'].all.requested).toBe(extra);
+    // A value already seen that day keeps counting as itself after the cap.
+    recorders[0].record('coinbase_attestation', 'completed', undefined, undefined, { scope: values[0] });
+    await until(async () => (await readStats(redis, [today()])).dimensions.scope[values[0]].all.completed === 1);
+    // The cap set expires with the day, like the counts.
+    expect(await redis.ttl(`relay:stats:dim-seen:scope:${today()}`)).toBeGreaterThan(0);
+    second.disconnect();
   });
 });

@@ -15,7 +15,9 @@ import { NEEDS_WALLET_SIGNATURE } from './signaturePolicy';
 import { Lifecycle, STATUS_TTL_SECONDS } from './lifecycle';
 import { describeBody, describeDeepLink, maskHex, maskIp, scrubError, scrubText } from './mask';
 import { bearerMatches, checkRange, ERROR_CODE_RE, readStats, StatsRecorder, TerminalOutcome } from './stats';
-import { clientIp, TRUSTED_PROXY_HOPS } from './clientIp';
+import { clientIpReader } from './clientIp';
+import type { Edge } from './edge';
+import { countryLabel, originLabel, scopeLabel } from './labels';
 import { createStatsAuthGuard, STATS_AUTH_MAX_FAILURES, StatsAuthGuard } from './statsAuth';
 import { mountAdmin } from './admin';
 
@@ -92,6 +94,8 @@ export interface RelayOptions {
   statsAuth?: StatsAuthGuard;
   /** Socket.IO adapter. The Redis adapter in every deployment; null only for a single in-process test instance. */
   adapter: ServerOptions['adapter'] | null;
+  /** What sits in front of the relay (edge.ts): proxy hops and the country header. */
+  edge: Edge;
   /** Public base URL the app posts callbacks to; empty means "derive from the request". */
   relayExternalUrl: string;
   port: number;
@@ -136,10 +140,12 @@ export function createRelay(options: RelayOptions): Relay {
   const app = express();
   const httpServer = createServer(app);
 
-  // See clientIp.ts: exactly one hop (Google's front end), never `true`.
+  // See clientIp.ts and edge.ts: the hops our own front ends add, never `true`.
   // Set so `req.ip` and `req.protocol` agree with clientIp(); the relay's own
   // code reads clientIp() so HTTP and Socket.IO share one definition.
-  app.set('trust proxy', TRUSTED_PROXY_HOPS);
+  const { edge } = options;
+  const clientIp = clientIpReader(edge.proxyHops);
+  app.set('trust proxy', edge.proxyHops);
 
   app.use(helmet());
   const corsMiddleware = cors({ origin: PUBLIC_CORS_ORIGIN });
@@ -277,7 +283,11 @@ export function createRelay(options: RelayOptions): Relay {
     proofNs.to(r).emit('proof:result', result);
   }
 
-  function countOutcome(meta: RequestMeta | null, result: ProofResult): void {
+  /**
+   * `country` is the label of where the app's callback came from; absent for
+   * outcomes the relay produced itself (expiry), where no phone answered.
+   */
+  function countOutcome(meta: RequestMeta | null, result: ProofResult, country?: string): void {
     if (!meta) {
       // A request opened by a relay version that did not record its circuit.
       // Its `requested` was never counted either, so skipping keeps the two consistent.
@@ -285,7 +295,10 @@ export function createRelay(options: RelayOptions): Relay {
       return;
     }
     const outcome = STATS_OUTCOME[result.status];
-    stats.record(meta.circuitId, outcome, outcome === 'error' ? result.errorCode : undefined);
+    stats.record(meta.circuitId, outcome, outcome === 'error' ? result.errorCode : undefined, undefined, {
+      ...meta.labels,
+      ...(country !== undefined && { country }),
+    });
   }
 
   /** Expires one request if this caller wins it. True when it did. */
@@ -360,7 +373,7 @@ export function createRelay(options: RelayOptions): Relay {
     dappIcon?: string;
     message?: string;
     returnScheme?: string;
-  }, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
+  }, origin: unknown, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
     const { requestId: reqId, circuitId, scope, inputs, nonce, challenge, signature } = body;
 
     console.log(`[Relay] processProofRequest: requestId=${reqId}, circuitId=${circuitId}, challenge=${maskHex(challenge)}, signature=${maskHex(signature)}`);
@@ -460,10 +473,13 @@ export function createRelay(options: RelayOptions): Relay {
 
     const deepLink = buildDeepLink(proofRequest);
     const status: ProofStatus = { requestId, status: 'pending', deepLink, createdAt: now, updatedAt: now };
-    const meta = await lifecycle.open(status, circuitId, nowMs);
+    // Envelope only: the page that asked (browser Origin header) and the
+    // top-level scope field. Nothing inside `inputs` is read.
+    const labels = { origin: originLabel(origin), scope: scopeLabel(scope) };
+    const meta = await lifecycle.open(status, circuitId, nowMs, labels);
     console.log(`[Relay] Status stored: requestId=${requestId}, status=pending, ttl=${STATUS_TTL_SECONDS}s, deadlineAt=${new Date(meta.deadlineAt).toISOString()}`);
 
-    stats.record(circuitId, 'requested');
+    stats.record(circuitId, 'requested', undefined, undefined, labels);
 
     proofNs.to(room(requestId)).emit('proof:status', { requestId, status: 'pending' });
     console.log(`[Relay] Proof request created successfully: requestId=${requestId}, circuitId=${circuitId}, inputsHash=${maskHex(inputsHash)}`);
@@ -491,7 +507,7 @@ export function createRelay(options: RelayOptions): Relay {
       const relayBaseUrl = `${req.protocol}://${req.get('host')}`;
       console.log(`[Relay REST] POST /api/v1/proof/request from IP: ${maskIp(clientIp(req))}, relayBaseUrl=${relayBaseUrl}, ${describeBody(req.body)}`);
 
-      const result = await processProofRequest(req.body || {}, relayBaseUrl);
+      const result = await processProofRequest(req.body || {}, req.headers.origin, relayBaseUrl);
       if (!result.ok) {
         console.log(`[Relay REST] POST /api/v1/proof/request failed: code=${result.code}, error=${scrubText(result.error)}`);
         res.status(result.code).json({ error: result.error });
@@ -641,7 +657,10 @@ export function createRelay(options: RelayOptions): Relay {
         console.log(`[Relay Callback] Circuit mismatch: requestId=${requestId}, requested=${meta.circuitId}, callback=${scrubText(proofResult.circuit)}; stats use the requested circuit`);
       }
       deliver(proofResult);
-      countOutcome(meta, proofResult);
+      // Where the answer came from, as our own front end resolved it. With no
+      // such front end (edge.ts) there is nothing trustworthy to read.
+      const country = edge.regionHeader ? countryLabel(req.headers[edge.regionHeader]) : undefined;
+      countOutcome(meta, proofResult, country);
 
       res.json({ received: true });
       console.log(`[Relay Callback] Successfully processed: requestId=${requestId}, status=${status}, errorCode=${proofResult.errorCode}, circuit=${scrubText(proofResult.circuit)}, chainId=${proofResult.chainId}`);
@@ -748,7 +767,7 @@ export function createRelay(options: RelayOptions): Relay {
         return;
       }
       try {
-        const result = await processProofRequest(data || {});
+        const result = await processProofRequest(data || {}, socket.handshake.headers.origin);
         if (!result.ok) {
           console.log(`[Socket.IO] proof:request failed for ${socket.id}: code=${result.code}, error=${scrubText(result.error)}`);
           socket.emit('proof:error', { error: result.error, code: result.code });

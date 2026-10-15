@@ -19,6 +19,8 @@ export const ADMIN_ASSETS: Record<string, { file: string; type: string }> = {
   '/admin/admin.css': { file: 'admin.css', type: 'text/css; charset=utf-8' },
   '/admin/app.mjs': { file: 'app.mjs', type: 'text/javascript; charset=utf-8' },
   '/admin/core.mjs': { file: 'core.mjs', type: 'text/javascript; charset=utf-8' },
+  // Country shapes for the map, built by scripts/build-world-map.mjs.
+  '/admin/world.json': { file: 'world.json', type: 'application/json; charset=utf-8' },
 };
 
 /**

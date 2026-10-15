@@ -47,8 +47,120 @@ function report(days: Array<{ date: string; circuits: Record<string, CircuitCoun
       }
     }
   }
-  return { from: days[0]?.date ?? '', to: days[days.length - 1]?.date ?? '', days, totals: { circuits: totals, all }, unrecognized };
+  return { from: days[0]?.date ?? '', to: days[days.length - 1]?.date ?? '', days, totals: { circuits: totals, all }, dimensions: { origin: {}, scope: {}, country: {} }, unrecognized };
 }
+
+type Outcomes = { requested: number; completed: number; error: number; cancelled: number; expired: number; abandoned: number };
+function outcomes(o: Partial<Outcomes>): Outcomes {
+  const r = { requested: 0, completed: 0, error: 0, cancelled: 0, expired: 0, ...o };
+  return { ...r, abandoned: r.cancelled + r.expired };
+}
+function labelRow(value: string | null, marker: string | null, circuits: Record<string, Partial<Outcomes>>) {
+  const all = outcomes({});
+  const out: Record<string, Outcomes> = {};
+  for (const [c, o] of Object.entries(circuits)) {
+    out[c] = outcomes(o);
+    for (const k of ['requested', 'completed', 'error', 'cancelled', 'expired', 'abandoned'] as const) all[k] += out[c][k];
+  }
+  return { value, marker, circuits: out, all } as never;
+}
+function withLabels(): StatsReport {
+  const r = report([{ date: '2026-10-14', circuits: { mdl_kr_age: counts({ requested: 9, completed: 6 }), coinbase_attestation: counts({ requested: 3 }) } }]);
+  r.dimensions.origin = {
+    'v:dojangscan.com': labelRow('dojangscan.com', null, { mdl_kr_age: { requested: 6, completed: 4, cancelled: 1 } }),
+    'v:demo.zkproofport.app': labelRow('demo.zkproofport.app', null, { mdl_kr_age: { requested: 3, completed: 2 }, coinbase_attestation: { requested: 3 } }),
+    'm:none': labelRow(null, 'none', {}),
+  };
+  r.dimensions.scope = { 'm:other': labelRow(null, 'other', { mdl_kr_age: { requested: 1 } }) };
+  r.dimensions.country = {
+    'v:KR': labelRow('KR', null, { mdl_kr_age: { completed: 5, error: 1 } }),
+    'v:US': labelRow('US', null, { mdl_kr_age: { completed: 1 }, coinbase_attestation: { cancelled: 1 } }),
+    'm:unknown': labelRow(null, 'unknown', { mdl_kr_age: { error: 2 } }),
+  };
+  return r;
+}
+
+describe('labels (site, scope, country)', () => {
+  it('rows are busiest first, a marker reads as Korean text, a value as itself', () => {
+    const rows = core.dimensionRows(withLabels(), 'origin');
+    // Both sites have 6 requests; the tie goes to the one with more answers (5 vs 2).
+    expect(rows.map((r) => r.label)).toEqual(['dojangscan.com', 'demo.zkproofport.app', '(보내지 않음)']);
+    expect(rows[0]).toMatchObject({ requested: 6, completed: 4, cancelled: 1, rate: '66.7%' });
+  });
+
+  it('a circuit filter keeps only that circuit and drops labels without it', () => {
+    const rows = core.dimensionRows(withLabels(), 'origin', 'coinbase_attestation');
+    expect(rows).toEqual([expect.objectContaining({ label: 'demo.zkproofport.app', requested: 3, completed: 0 })]);
+  });
+
+  it('a label filter: per-circuit rows and totals of that label only', () => {
+    const r = withLabels();
+    expect(core.labelCircuitRows(r, 'origin', 'v:demo.zkproofport.app').map((x) => [x.circuit, x.requested])).toEqual([
+      ['coinbase_attestation', 3], ['mdl_kr_age', 3],
+    ]);
+    expect(core.labelTotals(r, 'origin', 'v:dojangscan.com')).toMatchObject({ requested: 6, completed: 4, rate: '66.7%' });
+    expect(core.labelTotals(r, 'origin', 'v:dojangscan.com', 'coinbase_attestation')).toMatchObject({ requested: 0, rate: '—' });
+    expect(core.labelTotals(r, 'origin', 'v:gone.example')).toMatchObject({ requested: 0, rate: '—' });
+    expect(core.labelCircuitRows(r, 'origin', 'v:gone.example')).toEqual([]);
+  });
+
+  it('an unknown label kind is an error, never another kind', () => {
+    expect(() => core.dimensionRows(withLabels(), 'site')).toThrow(/Unknown label kind 'site'/);
+  });
+
+  it('a relay that sent no dimensions reads as empty, not as a crash', () => {
+    const r = withLabels() as unknown as Record<string, unknown>;
+    delete r.dimensions;
+    expect(core.dimensionRows(r as unknown as StatsReport, 'country')).toEqual([]);
+  });
+
+  it('a label is text only: markup in a value comes back as the same characters', () => {
+    const r = withLabels();
+    r.dimensions.scope['v:%3Cimg%3E'] = labelRow('<img src=x onerror=alert(1)>', null, { mdl_kr_age: { requested: 1 } });
+    expect(core.dimensionRows(r, 'scope').map((x) => x.label)).toContain('<img src=x onerror=alert(1)>');
+  });
+});
+
+describe('country map', () => {
+  it('shades: 0 for nothing, the busiest is the darkest, one answer the lightest', () => {
+    expect(core.shadeFor(0, 10)).toBe(0);
+    expect(core.shadeFor(5, 0)).toBe(0);
+    expect(core.shadeFor(1, 1)).toBe(core.MAP_SHADES);
+    expect(core.shadeFor(10, 10)).toBe(core.MAP_SHADES);
+    expect(core.shadeFor(1, 10_000)).toBe(1);
+    const steps = [1, 10, 100, 1000, 10_000].map((n) => core.shadeFor(n, 10_000));
+    expect([...steps].sort((a, b) => a - b)).toEqual(steps);
+    expect(steps.every((s) => s >= 1 && s <= core.MAP_SHADES)).toBe(true);
+  });
+
+  it('only real country codes with answers are on the map; markers stay in the table', () => {
+    const shades = core.mapShades(withLabels());
+    expect(Object.keys(shades).sort()).toEqual(['KR', 'US']);
+    expect(shades.KR).toEqual({ count: 6, shade: core.MAP_SHADES });
+    expect(shades.US.count).toBe(2);
+  });
+
+  it('a circuit filter recolours the map for that circuit', () => {
+    expect(core.mapShades(withLabels(), 'coinbase_attestation')).toEqual({ US: { count: 1, shade: core.MAP_SHADES } });
+  });
+
+  it('clicking a country: its name, totals and per-circuit answers, busiest first', () => {
+    const d = core.countryDetail(withLabels(), 'US');
+    expect(d.code).toBe('US');
+    expect(d.name).toContain('US');
+    expect(d.total).toEqual({ completed: 1, error: 0, cancelled: 1, answered: 2 });
+    expect(d.circuits.map((c) => c.circuit)).toEqual(['coinbase_attestation', 'mdl_kr_age']);
+  });
+
+  it('a country with no answers opens empty rather than failing', () => {
+    expect(core.countryDetail(withLabels(), 'FR')).toMatchObject({ code: 'FR', total: { answered: 0 }, circuits: [] });
+  });
+
+  it('country names are Korean where the runtime knows them, the bare code otherwise', () => {
+    expect(core.countryName('KR')).toBe('대한민국 (KR)');
+    expect(core.countryName('ZZ')).toMatch(/ZZ/);
+  });
+});
 
 describe('range presets', () => {
   it('the page and the server agree on the longest range', () => {

@@ -32,3 +32,23 @@ export function chartGeometry(
 ): { bars: Bar[]; ticks: Array<{ value: number; y: number }>; yMax: number; plot: { left: number; top: number; width: number; height: number; bottom: number } };
 export function tokenFormatError(token: unknown): string;
 export function retryAfterMinutes(header: string | null): number | null;
+
+export const DIMENSIONS: Array<'origin' | 'scope' | 'country'>;
+export const MARKER_TEXT: Record<string, string>;
+export interface LabelRow extends FlatCounts { key: string; label: string; rate: string }
+export function labelText(row: { value: string | null; marker: string | null }, kind: string): string;
+export function countryName(code: string): string;
+export function dimensionRows(report: StatsReport, kind: string, circuit?: string): LabelRow[];
+export function labelCircuitRows(report: StatsReport, kind: string, key: string): CircuitRow[];
+export function labelTotals(report: StatsReport, kind: string, key: string, circuit?: string): FlatCounts & { rate: string };
+export const MAP_SHADES: number;
+export function answered(counts: { completed: number; error: number; cancelled: number }): number;
+export function shadeFor(count: number, max: number): number;
+export function mapShades(report: StatsReport, circuit?: string): Record<string, { count: number; shade: number }>;
+export interface CountryDetail {
+  code: string;
+  name: string;
+  total: { completed: number; error: number; cancelled: number; answered: number };
+  circuits: Array<{ circuit: string; completed: number; error: number; cancelled: number; answered: number }>;
+}
+export function countryDetail(report: StatsReport, code: string): CountryDetail;

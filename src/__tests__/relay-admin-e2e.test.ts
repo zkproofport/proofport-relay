@@ -64,12 +64,51 @@ describe('caller address on the container', () => {
   });
 });
 
+describe('stats by site, scope and country on the container', () => {
+  it('the page that asked, the envelope scope and the answering country reach the stats API', async () => {
+    const ip = freshIp();
+    const run = `${runOctet}-${Date.now()}`;
+    const origin = `https://labels-${run}.example`;
+    const scope = `labels-e2e-${run}`;
+    const ch = await (await fetch(`${A}/api/v1/challenge`, { headers: { 'X-Forwarded-For': ip } })).json() as { requestId: string; challenge: string };
+    const created = await fetch(`${A}/api/v1/proof/request`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': ip, Origin: origin },
+      body: JSON.stringify({ requestId: ch.requestId, challenge: ch.challenge, circuitId: 'mdl_kr_age', inputs: {}, scope }),
+    });
+    expect(created.status).toBe(201);
+    // CORS answers the dApp's own origin as allowed (any origin may call).
+    expect(created.headers.get('access-control-allow-origin')).toBe('*');
+    const answered = await fetch(`${A}/api/v1/proof/callback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Relay-Client-Region': 'JP' },
+      body: JSON.stringify({ requestId: ch.requestId, status: 'completed', circuit: 'mdl_kr_age' }),
+    });
+    expect(answered.status).toBe(200);
+
+    const day = new Date().toISOString().slice(0, 10);
+    const host = new URL(origin).host;
+    let dims: Record<string, Record<string, { value: string | null; all: Record<string, number> }>> = {};
+    for (let i = 0; i < 20; i++) {
+      const res = await fetch(`${A}/api/v1/stats?from=${day}&to=${day}`, { headers: { Authorization: `Bearer ${TOKEN}`, 'X-Forwarded-For': ip } });
+      expect(res.status).toBe(200);
+      dims = ((await res.json()) as { dimensions: typeof dims }).dimensions;
+      if (dims.origin[`v:${host}`]?.all.completed === 1) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(dims.origin[`v:${host}`]).toMatchObject({ value: host, all: { requested: 1, completed: 1 } });
+    expect(dims.scope[`v:${scope}`]).toMatchObject({ value: scope, all: { requested: 1, completed: 1 } });
+    expect(dims.country['v:JP'].all.completed).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe('/admin on the container', () => {
   it.each([
     ['/admin', 'text/html; charset=utf-8'],
     ['/admin/admin.css', 'text/css; charset=utf-8'],
     ['/admin/app.mjs', 'text/javascript; charset=utf-8'],
     ['/admin/core.mjs', 'text/javascript; charset=utf-8'],
+    ['/admin/world.json', 'application/json; charset=utf-8'],
   ])('%s: 200, %s, every security header, no CORS', async (p, type) => {
     const res = await fetch(`${A}${p}`, { headers: { Origin: 'https://evil.example' } });
     expect(res.status).toBe(200);

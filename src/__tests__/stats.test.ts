@@ -8,6 +8,8 @@ import {
   statsField,
   statsKey,
   STATS_MAX_RANGE_DAYS,
+  DIMENSION_LUA,
+  DIMENSION_MAX_VALUES_PER_DAY,
   STATS_TTL_SECONDS,
   utcDay,
 } from '../stats';
@@ -87,6 +89,7 @@ function fakeRedis(exec: () => Promise<unknown>) {
   const multi = {
     hincrby: (...a: unknown[]) => { calls.push(['hincrby', ...a]); return multi; },
     expire: (...a: unknown[]) => { calls.push(['expire', ...a]); return multi; },
+    eval: (...a: unknown[]) => { calls.push(['eval', ...a]); return multi; },
     exec,
   };
   return { client: { multi: () => multi } as unknown as Redis, calls };
@@ -100,6 +103,34 @@ describe('createStatsRecorder', () => {
       ['hincrby', 'relay:stats:2026-10-14', 'coinbase_attestation|error|E2007', 1],
       ['expire', 'relay:stats:2026-10-14', STATS_TTL_SECONDS],
     ]);
+  });
+
+  it('with labels, adds one capped script call per label in the same MULTI, on the same day', () => {
+    const { client, calls } = fakeRedis(() => Promise.resolve([]));
+    createStatsRecorder(client).record('mdl_kr_age', 'completed', undefined, new Date('2026-10-14T23:59:59.999Z'), {
+      origin: 'v:dojangscan.com', scope: 'm:none', country: 'v:KR',
+    });
+    expect(calls.slice(0, 2).map((c) => c[0])).toEqual(['hincrby', 'expire']);
+    expect(calls.slice(2)).toEqual(
+      (['origin', 'scope', 'country'] as const).map((kind, i) => [
+        'eval', DIMENSION_LUA, 2, `relay:stats:dim:${kind}:2026-10-14`, `relay:stats:dim-seen:${kind}:2026-10-14`,
+        ['v:dojangscan.com', 'm:none', 'v:KR'][i], 'mdl_kr_age|completed', DIMENSION_MAX_VALUES_PER_DAY, STATS_TTL_SECONDS, 'm:other',
+      ]),
+    );
+  });
+
+  it('a label kind that was not given is not written at all (expiry has no country)', () => {
+    const { client, calls } = fakeRedis(() => Promise.resolve([]));
+    createStatsRecorder(client).record('mdl_kr_age', 'expired', undefined, undefined, { origin: 'v:a.com', scope: 'v:s' });
+    expect(calls.filter((c) => c[0] === 'eval').map((c) => c[3])).toEqual([
+      expect.stringContaining('dim:origin:'), expect.stringContaining('dim:scope:'),
+    ]);
+  });
+
+  it('an error outcome is counted by label as "error", without its code', () => {
+    const { client, calls } = fakeRedis(() => Promise.resolve([]));
+    createStatsRecorder(client).record('mdl_kr_age', 'error', 'E2007', undefined, { origin: 'v:a.com' });
+    expect(calls.find((c) => c[0] === 'eval')![6]).toBe('mdl_kr_age|error');
   });
 
   it('lands an event one millisecond later on the next day', () => {
@@ -190,9 +221,41 @@ describe('readStats', () => {
     expect(report.unrecognized).toEqual({ '2026-10-14:coinbase_attestation|weird': 2, '2026-10-14:x|error|bad': 1 });
   });
 
+  it('sums label hashes over the range per label and circuit, abandoned = cancelled + expired', async () => {
+    const redis = pipelineOf({
+      'relay:stats:dim:origin:2026-10-14': { 'v:dojangscan.com|mdl_kr_age|requested': '2', 'v:dojangscan.com|mdl_kr_age|cancelled': '1', 'm:none|coinbase_attestation|requested': '1' },
+      'relay:stats:dim:origin:2026-10-15': { 'v:dojangscan.com|mdl_kr_age|requested': '1', 'v:dojangscan.com|mdl_kr_age|expired': '1' },
+      'relay:stats:dim:country:2026-10-15': { 'v:KR|mdl_kr_age|completed': '3', 'm:unknown|mdl_kr_age|error': '1' },
+      'relay:stats:dim:scope:2026-10-14': { 'v:a%7Cb|mdl_kr_age|requested': '1' },
+    });
+    const report = await readStats(redis, ['2026-10-14', '2026-10-15']);
+    expect(report.dimensions.origin['v:dojangscan.com']).toEqual({
+      value: 'dojangscan.com', marker: null,
+      circuits: { mdl_kr_age: { requested: 3, completed: 0, error: 0, cancelled: 1, expired: 1, abandoned: 2 } },
+      all: { requested: 3, completed: 0, error: 0, cancelled: 1, expired: 1, abandoned: 2 },
+    });
+    expect(report.dimensions.origin['m:none']).toMatchObject({ value: null, marker: 'none' });
+    expect(report.dimensions.country['v:KR'].all.completed).toBe(3);
+    expect(report.dimensions.country['m:unknown']).toMatchObject({ marker: 'unknown', all: { error: 1 } });
+    expect(report.dimensions.scope['v:a%7Cb'].value).toBe('a|b');
+    expect(report.unrecognized).toEqual({});
+  });
+
+  it('reports label fields it does not understand instead of dropping them', async () => {
+    const redis = pipelineOf({ 'relay:stats:dim:origin:2026-10-14': { 'dojangscan.com|x|requested': '1', 'v:a|x|weird': '2', 'v:a|requested': '3' } });
+    const report = await readStats(redis, ['2026-10-14']);
+    expect(report.dimensions.origin).toEqual({});
+    expect(report.unrecognized).toEqual({
+      '2026-10-14:origin:dojangscan.com|x|requested': 1,
+      '2026-10-14:origin:v:a|x|weird': 2,
+      '2026-10-14:origin:v:a|requested': 3,
+    });
+  });
+
   it('answers zeros for a day with no data', async () => {
     const report = await readStats(pipelineOf({}), ['2026-10-14']);
     expect(report.days).toEqual([{ date: '2026-10-14', circuits: {} }]);
+    expect(report.dimensions).toEqual({ origin: {}, scope: {}, country: {} });
     expect(report.totals.all.requested).toBe(0);
   });
 });
