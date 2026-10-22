@@ -1,4 +1,4 @@
-import type { CircuitId } from '@zkproofport-app/sdk/circuits';
+import type { CircuitId } from '@zkproofport-app/core/circuits';
 
 /**
  * Whether a circuit's request must arrive with a wallet signature.
@@ -7,7 +7,8 @@ import type { CircuitId } from '@zkproofport-app/sdk/circuits';
  * never looks inside `inputs`; see the inspection-scope rule in
  * .claude/agents/relay-dev.md.
  *
- * Keyed by the SDK's `CircuitId`, and that is the load-bearing part. The two
+ * Keyed by `CircuitId` from `@zkproofport-app/core` (the package the SDK
+ * re-exports its circuit ids from), and that is the load-bearing part. The two
  * arrays this replaced were typed out by hand with no dependency on the SDK at
  * all, so a circuit added to the SDK reached the check below, matched neither
  * array and was refused -- correct, but silent, and nobody learned that a
@@ -37,8 +38,8 @@ export const SIGNATURE_POLICY = {
   // checked THROUGH Object.freeze(), which is a generic call and so swallows
   // excess-property checking. That version compiled cleanly with a key the
   // SDK had never defined -- a guard that looked like it bit and did not.
-  // `satisfies` checks both directions on the literal: a circuit the SDK added and nobody classified, and a key naming a circuit the installed
-  // SDK has never heard of.
+  // `satisfies` checks both directions on the literal: a circuit core added and nobody classified, and a key naming a circuit the installed
+  // core has never heard of.
 } satisfies Record<CircuitId, boolean>;
 
 /** The frozen view the request path reads. */

@@ -7,7 +7,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { createHash } from 'crypto';
 import type Redis from 'ioredis';
 import { ethers } from 'ethers';
-import { isCircuitId, ALL_CIRCUIT_IDS } from '@zkproofport-app/sdk/circuits';
+import { isCircuitId, ALL_CIRCUIT_IDS } from '@zkproofport-app/core/circuits';
 import type { ProofRequest, ProofResult, ProofSession, ProofStatus, RequestMeta, TerminalStatus } from './types';
 import { APP_TERMINAL_STATUSES, INTERMEDIATE_STATUSES, TERMINAL_STATUSES } from './types';
 import { validateReturnScheme } from './returnScheme';
