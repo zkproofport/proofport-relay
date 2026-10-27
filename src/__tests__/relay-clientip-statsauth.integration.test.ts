@@ -16,6 +16,9 @@ import { EDGES } from '../edge';
 import { createStatsRecorder } from '../stats';
 import { STATS_AUTH_KEY_PREFIX, STATS_AUTH_MAX_FAILURES, STATS_AUTH_WINDOW_SECONDS, statsAuthKey } from '../statsAuth';
 
+/** The relay's public origin in tests; every deep link's callbackUrl must be built from it. */
+const TEST_EXTERNAL_URL = 'https://relay.example.test';
+
 const REDIS_TEST_URL = process.env.REDIS_TEST_URL;
 if (!REDIS_TEST_URL) {
   throw new Error('REDIS_TEST_URL is required (e.g. redis://localhost:6379/15). Run scripts/test-relay.sh integration.');
@@ -54,8 +57,7 @@ async function start(): Promise<string> {
     statsToken: TOKEN,
     adapter: null,
     edge: EDGES.local,
-    relayExternalUrl: '',
-    port: 0,
+    relayExternalUrl: TEST_EXTERNAL_URL,
     deadlineMs: LONG,
     sweepIntervalMs: LONG,
   });

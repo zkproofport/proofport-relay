@@ -4,6 +4,7 @@ import { createAdapter } from '@socket.io/redis-adapter';
 import { createRelay, REQUEST_DEADLINE_MS, SWEEP_INTERVAL_MS } from './app';
 import { createStatsRecorder } from './stats';
 import { edgeFor } from './edge';
+import { parseRelayExternalUrl } from './externalUrl';
 import { scrubError, scrubText } from './mask';
 
 dotenv.config();
@@ -13,7 +14,6 @@ dotenv.config();
 // value with a default, per the project rule on non-critical settings.
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT || '4001', 10);
-const nodeEnv = process.env.NODE_ENV || 'development';
 
 const REDIS_URL = process.env.REDIS_URL;
 if (!REDIS_URL) throw new Error('REDIS_URL environment variable is required');
@@ -35,10 +35,12 @@ if (RELAY_STATS_TOKEN.length < 32) {
 /** What sits in front of the relay; see edge.ts. Required, no default. */
 const EDGE = edgeFor(process.env.RELAY_EDGE);
 
-if ((nodeEnv === 'production' || nodeEnv === 'staging') && !process.env.RELAY_EXTERNAL_URL) {
-  throw new Error('RELAY_EXTERNAL_URL environment variable is required in production/staging');
-}
-const RELAY_EXTERNAL_URL = process.env.RELAY_EXTERNAL_URL || '';
+/**
+ * The relay's public origin, put in every deep link as the callback URL.
+ * Required everywhere (externalUrl.ts): it used to fall back to the request's
+ * Host header, which let the caller choose where the app posts its proof.
+ */
+const RELAY_EXTERNAL_URL = parseRelayExternalUrl(process.env.RELAY_EXTERNAL_URL, EDGE);
 
 function connect(name: string): Redis {
   const client = new Redis(REDIS_URL!, {
@@ -71,7 +73,6 @@ async function main() {
     adapter: createAdapter(pub, sub),
     edge: EDGE,
     relayExternalUrl: RELAY_EXTERNAL_URL,
-    port: PORT,
     deadlineMs: REQUEST_DEADLINE_MS,
     sweepIntervalMs: SWEEP_INTERVAL_MS,
   });

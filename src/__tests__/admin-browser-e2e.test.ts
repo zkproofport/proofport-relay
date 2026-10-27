@@ -117,7 +117,7 @@ async function answerFrom(requestId: string, status: string, region: string) {
   const res = await fetch(`${A}/api/v1/proof/callback`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Relay-Client-Region': region },
-    body: JSON.stringify({ requestId, status, circuit: CIRCUIT, ...(status === 'error' && { errorCode: 'E2005' }) }),
+    body: JSON.stringify({ requestId, status, circuit: CIRCUIT, ...(status === 'error' && { errorCode: 'E2005' }), ...(status === 'completed' && { proof: '0x01', publicInputs: [] }) }),
   });
   expect(res.status).toBe(200);
 }

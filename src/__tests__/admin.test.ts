@@ -18,6 +18,9 @@ import { EDGES } from '../edge';
 import { ADMIN_ASSETS, ADMIN_DIR, ADMIN_SECURITY_HEADERS, loadAdminAssets, mountAdmin } from '../admin';
 import type { StatsAuthGuard } from '../statsAuth';
 
+/** The relay's public origin in tests; every deep link's callbackUrl must be built from it. */
+const TEST_EXTERNAL_URL = 'https://relay.example.test';
+
 const TOKEN = 'k'.repeat(64);
 const EXPECTED_CSP =
   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
@@ -42,8 +45,7 @@ async function startRelay(opts: { statsAuth?: StatsAuthGuard } = {}): Promise<{ 
     statsAuth: opts.statsAuth ?? { lockedFor: async () => 0, recordFailure: async () => 1 },
     adapter: null,
     edge: EDGES.local,
-    relayExternalUrl: '',
-    port: 0,
+    relayExternalUrl: TEST_EXTERNAL_URL,
     deadlineMs: 3_600_000,
     sweepIntervalMs: 3_600_000,
   });

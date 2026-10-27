@@ -83,7 +83,10 @@ export interface ProofStatus {
   chainId?: number;
   circuit?: string;
   deepLink?: string;
+  /** Legacy hash shipped apps recompute (inputsHash.ts). */
   inputsHash?: string;
+  /** Canonical hash over every depth (inputsHash.ts). */
+  inputsHashV2?: string;
   createdAt: string;
   updatedAt: string;
 }

@@ -1,15 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { createHash } from 'crypto';
 import { ethers } from 'ethers';
 
 // ---------------------------------------------------------------------------
 // Pure function re-implementations (mirrors src/index.ts exactly)
 // ---------------------------------------------------------------------------
-
-function computeInputsHash(inputs: Record<string, unknown>): string {
-  const canonical = JSON.stringify(inputs, Object.keys(inputs).sort());
-  return createHash('sha256').update(canonical).digest('hex');
-}
 
 function buildDeepLink(request: {
   requestId: string;
@@ -23,40 +17,6 @@ function buildDeepLink(request: {
   const data = Buffer.from(JSON.stringify(request)).toString('base64url');
   return `zkproofport://proof-request?data=${data}`;
 }
-
-// ---------------------------------------------------------------------------
-// Inputs Hash
-// ---------------------------------------------------------------------------
-
-describe('computeInputsHash', () => {
-  it('produces a consistent hash for the same inputs', () => {
-    const inputs = { scope: 'myapp.com', userAddress: '0x1234' };
-    expect(computeInputsHash(inputs)).toBe(computeInputsHash(inputs));
-  });
-
-  it('produces the same hash regardless of key insertion order', () => {
-    const inputs1 = { scope: 'myapp.com', userAddress: '0x1234' };
-    const inputs2 = { userAddress: '0x1234', scope: 'myapp.com' };
-    expect(computeInputsHash(inputs1)).toBe(computeInputsHash(inputs2));
-  });
-
-  it('produces different hashes for different input values', () => {
-    const inputs1 = { scope: 'myapp.com' };
-    const inputs2 = { scope: 'otherapp.com' };
-    expect(computeInputsHash(inputs1)).not.toBe(computeInputsHash(inputs2));
-  });
-
-  it('produces a valid 64-char hex string for nested objects', () => {
-    const inputs = { scope: 'test', countryList: ['US', 'KR'], isIncluded: true };
-    expect(computeInputsHash(inputs)).toMatch(/^[a-f0-9]{64}$/);
-  });
-
-  it('produces different hashes when array order differs', () => {
-    const inputs1 = { countryList: ['US', 'KR'] };
-    const inputs2 = { countryList: ['KR', 'US'] };
-    expect(computeInputsHash(inputs1)).not.toBe(computeInputsHash(inputs2));
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Challenge Generation

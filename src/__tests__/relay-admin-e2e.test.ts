@@ -82,7 +82,7 @@ describe('stats by site, scope and country on the container', () => {
     const answered = await fetch(`${A}/api/v1/proof/callback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Relay-Client-Region': 'JP' },
-      body: JSON.stringify({ requestId: ch.requestId, status: 'completed', circuit: 'mdl_kr_age' }),
+      body: JSON.stringify({ requestId: ch.requestId, status: 'completed', circuit: 'mdl_kr_age', proof: '0x01', publicInputs: [] }),
     });
     expect(answered.status).toBe(200);
 

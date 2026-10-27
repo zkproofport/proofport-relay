@@ -268,7 +268,7 @@ describe('Relay E2E: Challenge-Signature Auth Flow', () => {
       const res = await fetch(`${RELAY_URL}/api/v1/proof/callback`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ requestId: 'nonexistent-request-id', status: 'completed' }),
+        body: JSON.stringify({ requestId: 'nonexistent-request-id', status: 'completed', proof: '0x01', publicInputs: [] }),
       });
       expect(res.status).toBe(404);
     });

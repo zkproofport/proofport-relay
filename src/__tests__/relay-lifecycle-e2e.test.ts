@@ -30,6 +30,8 @@ const B = required('RELAY_B_URL');
 const TOKEN = required('RELAY_STATS_TOKEN');
 const REDIS_E2E_URL = required('REDIS_E2E_URL');
 const CIRCUIT = 'mdl_kr_ownership';
+/** What every `completed` answer must carry since 2026-10-27. */
+const PROOF = { proof: '0xdead', publicInputs: ['0x01'] };
 
 let redis: Redis;
 const sockets: ClientSocket[] = [];
@@ -128,7 +130,7 @@ describe('cross-instance delivery', () => {
   it('dApp socket on relay, app callback on relay-b: delivered', async () => {
     const requestId = await createRequest(B);
     const results = await dappSocket(A, requestId);
-    expect((await callback(B, { requestId, status: 'completed', proof: '0xbeef', circuit: CIRCUIT })).status).toBe(200);
+    expect((await callback(B, { requestId, status: 'completed', proof: '0xbeef', publicInputs: ['0x01'], circuit: CIRCUIT })).status).toBe(200);
     await until(() => results.length === 1, 5000);
     expect(results[0]).toMatchObject({ requestId, status: 'completed', proof: '0xbeef' });
   });
@@ -150,7 +152,7 @@ describe('terminal outcomes over real HTTP', () => {
 
     expect((await callback(A, { requestId, status: 'error', errorCode: 'E20' })).status).toBe(400);
     expect((await callback(A, { requestId, status: 'error', errorCode: 'E2007', error: 'Proof generation failed' })).status).toBe(200);
-    const dup = await callback(B, { requestId, status: 'completed' });
+    const dup = await callback(B, { requestId, status: 'completed', ...PROOF });
     expect(dup).toEqual({ status: 409, body: { error: 'This request has already been answered', reason: 'already_answered' } });
 
     await until(() => results.length === 1, 5000);
@@ -181,7 +183,7 @@ describe('relay-side timeout in the containers', () => {
     await until(() => results.length === 1, 12_000);
     expect(results[0]).toMatchObject({ requestId, status: 'expired', circuit: CIRCUIT });
     expect((await poll(B, requestId)).body).toMatchObject({ status: 'expired' });
-    const late = await callback(A, { requestId, status: 'completed' });
+    const late = await callback(A, { requestId, status: 'completed', ...PROOF });
     expect(late).toEqual({ status: 409, body: { error: 'The request timed out before the app answered', reason: 'expired' } });
 
     await new Promise((r) => setTimeout(r, 6000));
@@ -213,7 +215,7 @@ describe('GET /api/v1/stats on the container', () => {
   });
 
   it('callback for an unknown request is 404 on either container', async () => {
-    expect((await callback(A, { requestId: 'no-such-request', status: 'completed' })).status).toBe(404);
+    expect((await callback(A, { requestId: 'no-such-request', status: 'completed', ...PROOF })).status).toBe(404);
     expect((await callback(B, { requestId: 'no-such-request', status: 'error', errorCode: 'E2007' })).status).toBe(404);
   });
 });

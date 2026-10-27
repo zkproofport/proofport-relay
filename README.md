@@ -39,7 +39,7 @@ Proofport Relay is the communication hub of the Proofport zero-knowledge proof i
 6. **Deep Link**: Relay generates a base64-encoded deep link (`zkproofport://proof-request?data=...`) for mobile app invocation
 7. **Status**: Mobile app performs proof generation, posting intermediate and final status updates via `POST /api/v1/proof/callback`
 8. **Delivery**: Relay broadcasts to connected clients via Socket.IO
-9. **Polling**: Clients can poll `GET /api/v1/proof/:requestId` until completion (includes `inputsHash`)
+9. **Polling**: Clients can poll `GET /api/v1/proof/:requestId` until completion (includes `inputsHash` and `inputsHashV2`)
 
 ## Quick Start
 
@@ -92,7 +92,7 @@ Environment variables (see `.env.example`):
 |----------|---------|-------------|
 | `PORT` | `4001` | Server port |
 | `REDIS_URL` | (required) | Redis connection string |
-| `RELAY_EXTERNAL_URL` | (required for production) | External relay URL for deep link callbacks |
+| `RELAY_EXTERNAL_URL` | (required, every environment) | The relay's public origin, e.g. `https://relay.zkproofport.app`. Every deep link carries `<it>/api/v1/proof/callback` as the URL the app posts its proof to. Exactly an origin (no path, query, fragment or trailing slash), https unless `RELAY_EDGE=local` (`src/externalUrl.ts`). The relay refuses to start without it. Until 2026-10-27 an empty value made the relay build the callback URL from the request's `Host` header, so the caller chose where the phone posted its proof |
 | `RELAY_STATS_TOKEN` | (required, ≥ 32 chars) | Bearer token for `GET /api/v1/stats`. The relay refuses to start without it. Locally `scripts/dev.sh` generates one into `.env.development`; deployed environments read the Google Secret Manager secrets `relay-stats-token-staging` / `relay-stats-token-production` (mounted by `deploy.yml` with `--set-secrets`; GitHub secrets are write-only, so the token could never be read back to call the API) |
 | `RELAY_EDGE` | (required) | What sits in front of the relay (`src/edge.ts`): `cloud-run-domain` (Cloud Run domain mapping, 1 proxy hop, no country), `load-balancer` (external Application Load Balancer, 2 hops, country from `X-Relay-Client-Region`), `local` (Docker, 1 hop, headers believed for tests). Decides which `X-Forwarded-For` entry is the caller and whether the country header is trusted |
 | `NODE_ENV` | `development` | Environment mode |
@@ -191,9 +191,9 @@ alone would let `https://` through.
 
 **Status Codes:**
 - `201`: Request created successfully
-- `400`: Missing required fields, invalid inputs, or malformed `returnScheme`
+- `400`: Missing required fields, invalid inputs (including inputs nested more than 32 levels deep), a `nonce` that is not a string or is longer than 256 characters, or malformed `returnScheme`
 - `401`: Missing or invalid challenge/signature
-- `409`: Duplicate nonce (replay detected)
+- `409`: Session already used, or duplicate nonce (replay detected). The session and the nonce are claimed in ONE atomic Redis script: of any number of simultaneous requests on one session (or one nonce), on any instances, exactly one is accepted. A refused request claims nothing, so a duplicate nonce leaves the session usable with a fresh nonce
 - `429`: Rate limit exceeded
 - `500`: Internal server error
 
@@ -207,6 +207,7 @@ Poll proof request status.
   "status": "pending",
   "deepLink": "zkproofport://proof-request?data=eyJy...",
   "inputsHash": "a1b2c3d4e5f6789...",
+  "inputsHashV2": "0f1e2d3c4b5a697...",
   "createdAt": "2025-02-01T10:00:00.000Z",
   "updatedAt": "2025-02-01T10:00:00.000Z"
 }
@@ -230,6 +231,15 @@ After completion:
 
 A poll of a request past its deadline expires it on the spot (see [Request deadline](#request-deadline)).
 
+**`inputsHash` and `inputsHashV2`** (`src/inputsHash.ts`). The app checks the deep link it opened against one of these.
+
+| Field | Algorithm | Who reads it |
+|-------|-----------|--------------|
+| `inputsHash` | sha256 of `JSON.stringify(inputs, Object.keys(inputs).sort())`. The key array is an allowlist at every depth, so a nested object keeps only keys that also exist at the top level: `{a:{x:1}}` and `{a:{x:2}}` hash the same, and `giwa_attestation`'s `inputs.action` is not covered | Every shipped app (app-v1.4.0 and earlier, `validateRequestWithRelay`) recomputes exactly this and refuses the request as tampered when it differs. Kept unchanged so those apps keep working |
+| `inputsHashV2` | sha256 of the canonical JSON: keys sorted at every depth (UTF-16 order), arrays in order, no whitespace (RFC 8785 ordering and number form for parsed JSON) | What an app should check. A request opened by a relay before 2026-10-27 has no `inputsHashV2` |
+
+For inputs with no nested object the two are equal. The SDK (0.4.3, 0.5.0-beta.3) neither computes nor reads either.
+
 **Status Codes:**
 - `200`: Status retrieved
 - `404`: Request not found or expired (TTL: 10 minutes)
@@ -250,9 +260,12 @@ Receive proof completion callback from mobile app.
 ```json
 {
   "requestId": "550e8400-e29b-41d4-a716-446655440000",
+  "circuit": "coinbase_attestation",
   "status": "completed",
   "proof": "0x1234567890abcdef...",
-  "publicInputs": ["0x5678...", "0x9abc..."]
+  "publicInputs": ["0x5678...", "0x9abc..."],
+  "verifierAddress": "0x...",
+  "chainId": 8453
 }
 ```
 
@@ -277,6 +290,13 @@ Receive proof completion callback from mobile app.
 | `status` | `completed`, `error`, `cancelled` (terminal); `failed` is accepted as the older name for `error`; `generating` is the one intermediate status. Anything else, including `expired` (which only the relay writes), is 400 |
 | `errorCode` | Optional, `^E\d{4}$` (the app's ErrorModal codes). Malformed or non-string is 400. Stored and counted only on `error`/`failed` |
 | `error` | Optional string forwarded to the dApp. Cut to 1000 characters (code points). Never used as a statistics key. Non-string is 400 |
+| `circuit` | Optional string. When present it must equal the circuit the request was created with, for every status, or the callback is 400 and nothing is delivered (until 2026-10-27 a mismatch was logged and delivered). The delivered result always carries the circuit recorded at creation |
+| `proof` | String. Required, non-empty, on `completed` |
+| `publicInputs` | Array of strings (may be empty). Required on `completed` |
+| `verifierAddress` | Optional string |
+| `chainId` | Optional positive safe integer |
+
+Every optional field, when present, must have its type: `null` is not "absent" and is 400. Other fields the app sends (`nullifier`, `inputs`, timestamps) are ignored.
 
 **Response:**
 ```json
@@ -287,8 +307,9 @@ Receive proof completion callback from mobile app.
 
 **Status Codes:**
 - `200`: Callback received
-- `400`: Missing/invalid requestId or status, malformed errorCode, non-string error, malformed JSON
+- `400`: Missing/invalid requestId or status, a field of the wrong type, a `completed` answer without `proof` and `publicInputs`, a `circuit` other than the request's, malformed JSON. Field checks run before the request is looked up
 - `404`: Unknown or expired requestId
+- `429`: More than 60 callbacks a minute from one caller (see [Rate Limiting](#rate-limiting))
 - `409`: The request already has a terminal status. Nothing changes: no second result, no second emit, no second count. Body is stable: `reason: "expired"` after a relay timeout, `reason: "already_answered"` otherwise. The terminal record is kept 7 days, so an answer the app re-sends on a later launch gets this 409 rather than 404
 - `500`: Internal server error
 
@@ -296,7 +317,7 @@ Receive proof completion callback from mobile app.
 - The intermediate status (`generating`) updates status only, and never overwrites a terminal one
 - A terminal status is taken exactly once (an atomic Redis script decides the winner): the result is buffered, the status set, `proof:result` emitted to every instance's sockets, and the outcome counted
 - Result buffered in Redis for 5 minutes (client reconnection tolerance)
-- Statistics use the circuit recorded when the request was created, not the `circuit` the callback claims
+- Statistics and the delivered result use the circuit recorded when the request was created
 
 #### GET /api/v1/stats
 Per-circuit request statistics, per UTC day, plus range totals split by label in `dimensions`:
@@ -453,10 +474,13 @@ Per caller address, in memory, per instance, fixed 1-minute windows:
 |----------|-------|--------|
 | `GET /api/v1/challenge` | 30 requests | 1 minute per IP |
 | `POST /api/v1/proof/request` and Socket.IO `proof:request` (one shared budget) | 10 requests | 1 minute per IP |
+| `POST /api/v1/proof/callback` | 60 requests | 1 minute per IP |
 | `GET /api/v1/stats` (authenticated) | 60 requests | 1 minute per IP |
 | `GET /api/v1/stats` wrong token | 10 failures, then locked | 15 minutes per IP, across all instances (Redis) |
 
 Exceeding limits returns HTTP 429 with `Retry-After` (a socket gets `proof:error` with `code: 429`).
+
+The callback limit was added on 2026-10-27 (unlimited before). The app sends one answer per request (current builds send no `generating`), re-sending an undelivered one on up to three later launches, so 60 a minute leaves room for many phones behind one carrier NAT. Note that the current app treats a 429 on its answer as final and does not retry it, so the limit must stay well above what a shared address legitimately sends; Cloud Armor's 600/min per IP sits in front in production.
 
 **Which address.** `app.set('trust proxy', 1)` (`TRUSTED_PROXY_HOPS` in `src/clientIp.ts`): the relay's hostnames are Cloud Run domain mappings, and Google's front end appends the caller's address as the rightmost `X-Forwarded-For` entry; that entry is the caller, everything to its left is whatever the client wrote. `clientIp()` computes it the way Express computes `req.ip`, and HTTP routes and Socket.IO handshakes both use it. Before this, every request read the front end's own address (`169.254.169.126`), so each limit was one bucket for everyone. Never set it to `true` (that trusts the client-written leftmost entry). If a load balancer or CDN is ever put in front, the hop count changes -- see the comment on `TRUSTED_PROXY_HOPS`. Locally there is no front end: a request without the header is counted under Docker's gateway address, and one with it under its rightmost entry.
 
@@ -470,9 +494,11 @@ All session data cached in Redis with TTL:
 |-------------|-----|---------|
 | `proof:status:{requestId}` | 10 min | Current proof status |
 | `proof:result:{requestId}` | 5 min | Proof result (for reconnection) |
-| `proof:nonce:{nonce}` | 10 min | Nonce seen flag (replay prevention) |
-| `proof:inputsHash:{requestId}` | 10 min | SHA256 hash of proof inputs |
+| `proof:nonce:{nonce}` | 10 min | Nonce seen flag (replay prevention), written only by the atomic claim |
+| `proof:inputsHash:{requestId}` | 10 min | Legacy hash of proof inputs (`inputsHash`) |
+| `proof:inputsHashV2:{requestId}` | 10 min | Canonical hash of proof inputs (`inputsHashV2`) |
 | `session:{requestId}` | 10 min | Challenge session |
+| `session:claimed:{requestId}` | 10 min | The session has been used; written only by the atomic claim |
 | `proof:meta:{requestId}` | 10 min | Circuit as requested and the deadline (relay-internal) |
 | `proof:terminal:{requestId}` | 7 days | The terminal status taken; makes the terminal transition one-way |
 | `proof:deadlines` | — | Sorted set of open requests by deadline (ms) |
@@ -717,7 +743,9 @@ interface ProofResult {
 | Invalid signature | 401 | `Invalid signature` |
 | Missing circuitId | 400 | `circuitId is required` |
 | Missing inputs | 400 | `inputs object is required` |
-| Replay detected | 409 | `Duplicate nonce (replay detected)` |
+| Replay detected | 409 | `Duplicate nonce (replay detected)` / `Session already used (replay detected)` |
+| Callback naming another circuit | 400 | `circuit '<x>' does not match the request's circuit '<y>'` |
+| `completed` without a proof | 400 | `a completed answer must carry proof and publicInputs` |
 | Request expired | 404 | `Request not found or expired` |
 | Second terminal callback | 409 | `{ "error": "This request has already been answered", "reason": "already_answered" }` |
 | Callback after the relay timed the request out | 409 | `{ "error": "The request timed out before the app answered", "reason": "expired" }` |

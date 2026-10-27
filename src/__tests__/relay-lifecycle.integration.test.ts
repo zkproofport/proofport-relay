@@ -16,6 +16,9 @@ import { EDGES } from '../edge';
 import { createStatsRecorder, DIMENSION_MAX_VALUES_PER_DAY, readStats, StatsRecorder, utcDay } from '../stats';
 import { DEADLINES_KEY, metaKey, TERMINAL_TTL_SECONDS } from '../lifecycle';
 
+/** The relay's public origin in tests; every deep link's callbackUrl must be built from it. */
+const TEST_EXTERNAL_URL = 'https://relay.example.test';
+
 const REDIS_TEST_URL = process.env.REDIS_TEST_URL;
 if (!REDIS_TEST_URL) {
   throw new Error('REDIS_TEST_URL is required (e.g. redis://localhost:6379/15). Run scripts/test-relay.sh integration.');
@@ -26,6 +29,8 @@ if (!(db > 0)) {
 }
 
 const STATS_TOKEN = 't'.repeat(64);
+/** What every `completed` answer must carry since 2026-10-27. */
+const PROOF = { proof: '0xdead', publicInputs: ['0x01'] };
 const LONG = 3_600_000;
 
 let redis: Redis;
@@ -72,8 +77,7 @@ async function start(opts: {
     statsToken: STATS_TOKEN,
     adapter,
     edge: opts.edge ?? EDGES.local,
-    relayExternalUrl: '',
-    port: 0,
+    relayExternalUrl: TEST_EXTERNAL_URL,
     deadlineMs: opts.deadlineMs ?? LONG,
     sweepIntervalMs: opts.sweepIntervalMs ?? LONG,
   });
@@ -158,24 +162,63 @@ async function backdate(requestId: string) {
 // ---------------------------------------------------------------------------
 
 describe('terminal outcomes', () => {
-  it('completed: socket and poll both get it, stats count the REQUESTED circuit, not the claimed one', async () => {
+  it('completed: socket and poll both get it, carrying the REQUESTED circuit, counted once', async () => {
     const { url } = await start();
     const before = await todayCounts('coinbase_attestation');
-    const beforeClaimed = await todayCounts('mdl_kr_age');
     const { requestId } = await createRequest(url);
     const dapp = await dappSocket(url, requestId);
 
-    const cb = await callback(url, { requestId, status: 'completed', circuit: 'mdl_kr_age', proof: '0xdead', publicInputs: ['0x01'], chainId: 8453 });
+    const cb = await callback(url, { requestId, status: 'completed', circuit: 'coinbase_attestation', proof: '0xdead', publicInputs: ['0x01'], chainId: 8453 });
     expect(cb).toEqual({ status: 200, body: { received: true } });
 
     await until(() => dapp.results.length === 1);
-    expect(dapp.results[0]).toMatchObject({ requestId, status: 'completed', proof: '0xdead' });
-    expect((await poll(url, requestId)).body).toMatchObject({ status: 'completed', proof: '0xdead', publicInputs: ['0x01'] });
+    expect(dapp.results[0]).toMatchObject({ requestId, status: 'completed', proof: '0xdead', circuit: 'coinbase_attestation' });
+    expect((await poll(url, requestId)).body).toMatchObject({ status: 'completed', proof: '0xdead', publicInputs: ['0x01'], circuit: 'coinbase_attestation' });
 
     const after = await todayCounts('coinbase_attestation');
     expect(after.requested - before.requested).toBe(1);
     expect(after.completed - before.completed).toBe(1);
-    expect((await todayCounts('mdl_kr_age')).completed).toBe(beforeClaimed.completed);
+  });
+
+  it('an answer that omits the circuit is delivered under the circuit recorded at creation', async () => {
+    const { url } = await start();
+    const { requestId } = await createRequest(url);
+    const dapp = await dappSocket(url, requestId);
+    expect((await callback(url, { requestId, status: 'completed', ...PROOF })).status).toBe(200);
+    await until(() => dapp.results.length === 1);
+    expect(dapp.results[0].circuit).toBe('coinbase_attestation');
+    expect((await poll(url, requestId)).body.circuit).toBe('coinbase_attestation');
+  });
+
+  it('an answer naming another circuit is refused for every status: not delivered, not counted, request stays open', async () => {
+    const { url } = await start();
+    const before = await todayCounts('coinbase_attestation');
+    const beforeOther = await todayCounts('mdl_kr_age');
+    const { requestId } = await createRequest(url);
+    const dapp = await dappSocket(url, requestId);
+
+    for (const body of [
+      { status: 'completed', circuit: 'mdl_kr_age', ...PROOF },
+      { status: 'error', circuit: 'mdl_kr_age', errorCode: 'E2007' },
+      { status: 'cancelled', circuit: 'coinbase-kyc' },
+      { status: 'generating', circuit: 'COINBASE_ATTESTATION' },
+      { status: 'completed', circuit: 'coinbase_attestation ', ...PROOF },
+      { status: 'completed', circuit: '', ...PROOF },
+    ]) {
+      const cb = await callback(url, { requestId, ...body });
+      expect(cb.status).toBe(400);
+      expect(String(cb.body.error)).toContain("does not match the request's circuit 'coinbase_attestation'");
+    }
+    await settle();
+    expect(dapp.results).toHaveLength(0);
+    expect((await poll(url, requestId)).body.status).toBe('pending');
+    expect((await todayCounts('coinbase_attestation')).completed).toBe(before.completed);
+    expect((await todayCounts('mdl_kr_age')).completed).toBe(beforeOther.completed);
+
+    // The real answer still lands afterwards.
+    expect((await callback(url, { requestId, status: 'completed', circuit: 'coinbase_attestation', ...PROOF })).status).toBe(200);
+    await until(() => dapp.results.length === 1);
+    expect((await todayCounts('coinbase_attestation')).completed - before.completed).toBe(1);
   });
 
   it('error with errorCode: delivered with the code, counted under that code', async () => {
@@ -243,15 +286,15 @@ describe('idempotency', () => {
     const { requestId } = await createRequest(url);
     const dapp = await dappSocket(url, requestId);
 
-    expect((await callback(url, { requestId, status: 'completed', proof: '0x01' })).status).toBe(200);
+    expect((await callback(url, { requestId, status: 'completed', proof: '0x01', publicInputs: ['0x01'] })).status).toBe(200);
     const dup = await callback(url, { requestId, status: 'error', errorCode: 'E2007' });
     expect(dup).toEqual({ status: 409, body: { error: 'This request has already been answered', reason: 'already_answered' } });
-    const same = await callback(url, { requestId, status: 'completed', proof: '0x02' });
+    const same = await callback(url, { requestId, status: 'completed', proof: '0x02', publicInputs: ['0x01'] });
     expect(same.status).toBe(409);
 
     await settle();
     expect(dapp.results).toHaveLength(1);
-    expect((await poll(url, requestId)).body).toMatchObject({ status: 'completed', proof: '0x01' });
+    expect((await poll(url, requestId)).body).toMatchObject({ status: 'completed', proof: '0x01', publicInputs: ['0x01'] });
     const after = await todayCounts('coinbase_attestation');
     expect(after.completed - before.completed).toBe(1);
     expect((after.error.byCode.E2007 ?? 0) - (before.error.byCode.E2007 ?? 0)).toBe(0);
@@ -263,7 +306,7 @@ describe('idempotency', () => {
     await backdate(expired.requestId);
     await relay.sweep();
     const answered = await createRequest(url);
-    await callback(url, { requestId: answered.requestId, status: 'completed' });
+    await callback(url, { requestId: answered.requestId, status: 'completed', ...PROOF });
 
     // The app was killed and re-sends on a later launch, after the 10-minute
     // status and result are gone.
@@ -277,7 +320,7 @@ describe('idempotency', () => {
 
     // Once the terminal record is gone too, the request is unknown.
     await redis.del(`proof:terminal:${answered.requestId}`);
-    expect((await callback(url, { requestId: answered.requestId, status: 'completed' })).status).toBe(404);
+    expect((await callback(url, { requestId: answered.requestId, status: 'completed', ...PROOF })).status).toBe(404);
   });
 
   it('concurrent terminal callbacks: exactly one wins', async () => {
@@ -285,7 +328,7 @@ describe('idempotency', () => {
     const { requestId } = await createRequest(url);
     const dapp = await dappSocket(url, requestId);
     const replies = await Promise.all(
-      ['completed', 'error', 'cancelled', 'completed', 'error'].map((status) => callback(url, { requestId, status })),
+      ['completed', 'error', 'cancelled', 'completed', 'error'].map((status) => callback(url, { requestId, status, ...(status === 'completed' && PROOF) })),
     );
     expect(replies.filter((r) => r.status === 200)).toHaveLength(1);
     expect(replies.filter((r) => r.status === 409)).toHaveLength(4);
@@ -299,7 +342,7 @@ describe('idempotency', () => {
     const { requestId } = await createRequest(url);
     expect((await callback(url, { requestId, status: 'generating' })).status).toBe(200);
     expect((await poll(url, requestId)).body.status).toBe('generating');
-    await callback(url, { requestId, status: 'completed' });
+    await callback(url, { requestId, status: 'completed', ...PROOF });
     expect((await callback(url, { requestId, status: 'generating' })).status).toBe(409);
     expect((await poll(url, requestId)).body.status).toBe('completed');
   });
@@ -360,7 +403,7 @@ describe('callback validation', () => {
 
   it('answers 404 for an unknown requestId', async () => {
     const { url } = await start();
-    expect((await callback(url, { requestId: 'no-such-request', status: 'completed' })).status).toBe(404);
+    expect((await callback(url, { requestId: 'no-such-request', status: 'completed', ...PROOF })).status).toBe(404);
   });
 
   it('answers 400, not a stack trace, to a malformed JSON body', async () => {
@@ -384,7 +427,7 @@ describe('relay-side timeout', () => {
     expect(dapp.results[0]).toMatchObject({ requestId, status: 'expired', error: EXPIRED_MESSAGE, circuit: 'coinbase_attestation' });
     expect((await poll(url, requestId)).body).toMatchObject({ status: 'expired', error: EXPIRED_MESSAGE });
 
-    const late = await callback(url, { requestId, status: 'completed', proof: '0x01' });
+    const late = await callback(url, { requestId, status: 'completed', proof: '0x01', publicInputs: ['0x01'] });
     expect(late).toEqual({ status: 409, body: { error: 'The request timed out before the app answered', reason: 'expired' } });
 
     expect(await relay.sweep()).toBe(0);
@@ -433,7 +476,7 @@ describe('relay-side timeout', () => {
     const { requestId } = await createRequest(url);
     const dapp = await dappSocket(url, requestId);
     await backdate(requestId);
-    const late = await callback(url, { requestId, status: 'completed', proof: '0x01' });
+    const late = await callback(url, { requestId, status: 'completed', proof: '0x01', publicInputs: ['0x01'] });
     expect(late).toEqual({ status: 409, body: { error: 'The request timed out before the app answered', reason: 'expired' } });
     await until(() => dapp.results.length === 1);
     expect(dapp.results[0].status).toBe('expired');
@@ -469,7 +512,7 @@ describe('relay-side timeout', () => {
     const { requestId } = await createRequest(url);
     const dapp = await dappSocket(url, requestId);
     await backdate(requestId);
-    const [cb] = await Promise.all([callback(url, { requestId, status: 'completed' }), relay.sweep()]);
+    const [cb] = await Promise.all([callback(url, { requestId, status: 'completed', ...PROOF }), relay.sweep()]);
     expect(cb).toMatchObject({ status: 409, body: { reason: 'expired' } });
     await settle();
     expect(dapp.results).toHaveLength(1);
@@ -485,9 +528,9 @@ describe('cross-instance delivery (Redis adapter)', () => {
     const b = await start({ adapterKey: key });
     const { requestId } = await createRequest(a.url);
     const dapp = await dappSocket(a.url, requestId);
-    expect((await callback(b.url, { requestId, status: 'completed', proof: '0xbeef' })).status).toBe(200);
+    expect((await callback(b.url, { requestId, status: 'completed', proof: '0xbeef', publicInputs: ['0x01'] })).status).toBe(200);
     await until(() => dapp.results.length === 1);
-    expect(dapp.results[0]).toMatchObject({ status: 'completed', proof: '0xbeef' });
+    expect(dapp.results[0]).toMatchObject({ status: 'completed', proof: '0xbeef', publicInputs: ['0x01'] });
   });
 
   it('control: without the adapter the same callback never reaches the other instance', async () => {
@@ -495,7 +538,7 @@ describe('cross-instance delivery (Redis adapter)', () => {
     const b = await start();
     const { requestId } = await createRequest(a.url);
     const dapp = await dappSocket(a.url, requestId);
-    expect((await callback(b.url, { requestId, status: 'completed' })).status).toBe(200);
+    expect((await callback(b.url, { requestId, status: 'completed', ...PROOF })).status).toBe(200);
     await settle();
     expect(dapp.results).toHaveLength(0);
   });
@@ -510,7 +553,7 @@ describe('statistics never block the proof path', () => {
     const { requestId } = await createRequest(url);
     const dapp = await dappSocket(url, requestId);
     const started = Date.now();
-    expect((await callback(url, { requestId, status: 'completed' })).status).toBe(200);
+    expect((await callback(url, { requestId, status: 'completed', ...PROOF })).status).toBe(200);
     expect(Date.now() - started).toBeLessThan(1000);
     await until(() => dapp.results.length === 1);
     await until(() => errors.length >= 2);
@@ -680,7 +723,7 @@ describe('stats by site, scope and country', () => {
     if (region !== undefined) headers['X-Relay-Client-Region'] = region;
     const res = await fetch(`${url}/api/v1/proof/callback`, {
       method: 'POST', headers,
-      body: JSON.stringify({ requestId, status, circuit: 'coinbase_attestation', ...(status === 'error' && { errorCode: 'E2005' }) }),
+      body: JSON.stringify({ requestId, status, circuit: 'coinbase_attestation', ...(status === 'error' && { errorCode: 'E2005' }), ...(status === 'completed' && PROOF) }),
     });
     expect(res.status).toBe(200);
   }

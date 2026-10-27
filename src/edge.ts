@@ -7,6 +7,10 @@
  *                  were written by our own front ends (see clientIp.ts)
  *   regionHeader   the header a front end of ours writes with the caller's
  *                  country, or null when nothing trustworthy writes one
+ *   httpsOnly      whether RELAY_EXTERNAL_URL (the callback URL put in every
+ *                  deep link) must be https. True behind any real front end:
+ *                  the app posts the proof there. Only `local` allows http,
+ *                  for a phone on the same LAN as a developer's Docker.
  *
  * Rows:
  *   cloud-run-domain  Cloud Run domain mapping (`ghs.googlehosted.com`). Google's
@@ -30,12 +34,13 @@ export const REGION_HEADER = 'x-relay-client-region';
 export interface Edge {
   proxyHops: number;
   regionHeader: string | null;
+  httpsOnly: boolean;
 }
 
 export const EDGES = {
-  'cloud-run-domain': { proxyHops: 1, regionHeader: null },
-  'load-balancer': { proxyHops: 2, regionHeader: REGION_HEADER },
-  local: { proxyHops: 1, regionHeader: REGION_HEADER },
+  'cloud-run-domain': { proxyHops: 1, regionHeader: null, httpsOnly: true },
+  'load-balancer': { proxyHops: 2, regionHeader: REGION_HEADER, httpsOnly: true },
+  local: { proxyHops: 1, regionHeader: REGION_HEADER, httpsOnly: false },
 } as const satisfies Record<string, Edge>;
 
 export type EdgeName = keyof typeof EDGES;

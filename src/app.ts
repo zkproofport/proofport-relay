@@ -4,7 +4,6 @@ import { Server, ServerOptions, Socket } from 'socket.io';
 import cors from 'cors';
 import helmet from 'helmet';
 import { v4 as uuidv4 } from 'uuid';
-import { createHash } from 'crypto';
 import type Redis from 'ioredis';
 import { ethers } from 'ethers';
 import { isCircuitId, ALL_CIRCUIT_IDS } from '@zkproofport-app/core/circuits';
@@ -20,6 +19,8 @@ import type { Edge } from './edge';
 import { countryLabel, originLabel, scopeLabel } from './labels';
 import { createStatsAuthGuard, STATS_AUTH_MAX_FAILURES, StatsAuthGuard } from './statsAuth';
 import { mountAdmin } from './admin';
+import { computeInputsHashes, InputsNotJsonError, InputsTooDeepError } from './inputsHash';
+import { parseRelayExternalUrl } from './externalUrl';
 
 /**
  * How long the relay waits for the app before it answers the dApp itself.
@@ -56,10 +57,63 @@ const NONCE_TTL = 600;
 const SESSION_TTL = 600;
 const SESSION_KEY_PREFIX = 'session:';
 
+/** Longest `nonce` accepted. It becomes part of a Redis key. */
+export const NONCE_MAX_CHARS = 256;
+
+/**
+ * Claims a challenge session and, when one was sent, its nonce, in ONE
+ * atomic step. Until 2026-10-27 both were read, then written: two requests
+ * arriving together with the same session (or the same nonce) could both read
+ * "unused" and both be accepted.
+ *
+ * KEYS: session, claim, nonce (the nonce key only when a nonce was sent)
+ * ARGV: claimTtl, nonceTtl
+ * Returns: 'ok' | 'missing' | 'used' | 'nonce'
+ *
+ * The claim lives in its own key so the script never re-encodes the session
+ * JSON (cjson would rewrite numbers inside `inputs`). A session whose JSON
+ * already says something other than `pending` counts as used too: that is how
+ * a relay before this change marked a claim, and both kinds of instance run
+ * side by side during a rollout. Nothing is written unless every check passes,
+ * so a duplicate nonce no longer burns the session and a used session no
+ * longer burns the nonce.
+ */
+const CLAIM_LUA = `
+local session = redis.call('GET', KEYS[1])
+if not session then
+  return 'missing'
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return 'used'
+end
+local ok, decoded = pcall(cjson.decode, session)
+if not ok or type(decoded) ~= 'table' or decoded['status'] ~= 'pending' then
+  return 'used'
+end
+if KEYS[3] and redis.call('EXISTS', KEYS[3]) == 1 then
+  return 'nonce'
+end
+redis.call('SET', KEYS[2], '1', 'EX', ARGV[1])
+if KEYS[3] then
+  redis.call('SET', KEYS[3], '1', 'EX', ARGV[2])
+end
+return 'ok'
+`;
+
 const RATE_LIMITS = {
   challenge: { windowMs: 60_000, max: 30 },
   /** Shared by POST /api/v1/proof/request and the Socket.IO `proof:request` event. */
   request: { windowMs: 60_000, max: 10 },
+  /**
+   * POST /api/v1/proof/callback. Unlimited until 2026-10-27. The app sends one
+   * answer per request (current builds send no `generating`) and re-sends an
+   * undelivered one on up to three later launches, so 60 a minute leaves room
+   * for many phones behind one carrier NAT. The current app treats a 429 on
+   * its answer as final (relayAnswer.ts), so keep this well above what a
+   * shared address legitimately sends. Same per-instance fixed window as the
+   * other limits; Cloud Armor's 600/min per IP sits in front in production.
+   */
+  callback: { windowMs: 60_000, max: 60 },
   /** Authenticated stats reads. Wrong tokens are limited separately (statsAuth.ts). */
   stats: { windowMs: 60_000, max: 60 },
 };
@@ -96,9 +150,12 @@ export interface RelayOptions {
   adapter: ServerOptions['adapter'] | null;
   /** What sits in front of the relay (edge.ts): proxy hops and the country header. */
   edge: Edge;
-  /** Public base URL the app posts callbacks to; empty means "derive from the request". */
+  /**
+   * The relay's public origin (RELAY_EXTERNAL_URL). Required: every deep link
+   * tells the app to post its proof to `<this>/api/v1/proof/callback`, and
+   * nothing a caller sends may choose that address. See externalUrl.ts.
+   */
   relayExternalUrl: string;
-  port: number;
   deadlineMs: number;
   sweepIntervalMs: number;
 }
@@ -136,6 +193,7 @@ export function createRelay(options: RelayOptions): Relay {
   if (!statsToken) throw new Error('statsToken is required');
   const statsAuth = options.statsAuth ?? createStatsAuthGuard(redis);
   const lifecycle = new Lifecycle(redis, options.deadlineMs);
+  const callbackUrl = `${parseRelayExternalUrl(options.relayExternalUrl, options.edge)}/api/v1/proof/callback`;
 
   const app = express();
   const httpServer = createServer(app);
@@ -209,7 +267,9 @@ export function createRelay(options: RelayOptions): Relay {
   // Sessions
   // -------------------------------------------------------------------------
   const sessionKey = (requestId: string) => `${SESSION_KEY_PREFIX}${requestId}`;
+  const claimKey = (requestId: string) => `${SESSION_KEY_PREFIX}claimed:${requestId}`;
   const inputsHashKey = (requestId: string) => `proof:inputsHash:${requestId}`;
+  const inputsHashV2Key = (requestId: string) => `proof:inputsHashV2:${requestId}`;
   const nonceKey = (nonce: string) => `proof:nonce:${nonce}`;
 
   async function createSession(ip: string): Promise<ProofSession> {
@@ -252,16 +312,12 @@ export function createRelay(options: RelayOptions): Relay {
     }
   }
 
-  // Known limitation: the replacer filters nested keys (e.g. giwa_attestation.action).
-  // Use recursive stable canonicalization before treating this hash as tamper-evident
-  // integrity protection for nested requests; it is not an action-bound circuit's
-  // exact-action authorization boundary -- the proof is.
-  function computeInputsHash(inputs: Record<string, unknown>): string {
-    const sortedKeys = Object.keys(inputs).sort();
-    const hash = createHash('sha256').update(JSON.stringify(inputs, sortedKeys)).digest('hex');
-    // The canonical JSON is the user's proof inputs; only its key names are logged.
-    console.log(`[Relay Hash] computeInputsHash: sortedKeys=${JSON.stringify(sortedKeys)}, hash=${maskHex(hash)}`);
-    return hash;
+  /** One atomic claim of the session and nonce (CLAIM_LUA). */
+  async function claimSession(requestId: string, nonce: string | undefined): Promise<'ok' | 'missing' | 'used' | 'nonce'> {
+    const keys = [sessionKey(requestId), claimKey(requestId), ...(nonce !== undefined ? [nonceKey(nonce)] : [])];
+    const outcome = await redis.eval(CLAIM_LUA, keys.length, ...keys, SESSION_TTL, NONCE_TTL);
+    if (outcome === 'ok' || outcome === 'missing' || outcome === 'used' || outcome === 'nonce') return outcome;
+    throw new Error(`Unexpected session claim outcome '${String(outcome)}'`);
   }
 
   function buildDeepLink(request: ProofRequest): string {
@@ -373,7 +429,7 @@ export function createRelay(options: RelayOptions): Relay {
     dappIcon?: string;
     message?: string;
     returnScheme?: string;
-  }, origin: unknown, relayBaseUrl?: string): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
+  }, origin: unknown): Promise<{ ok: true; requestId: string; deepLink: string; status: ProofStatus } | { ok: false; error: string; code: number }> {
     const { requestId: reqId, circuitId, scope, inputs, nonce, challenge, signature } = body;
 
     console.log(`[Relay] processProofRequest: requestId=${reqId}, circuitId=${circuitId}, challenge=${maskHex(challenge)}, signature=${maskHex(signature)}`);
@@ -387,10 +443,8 @@ export function createRelay(options: RelayOptions): Relay {
       console.log(`[Relay] processProofRequest rejected: session not found — requestId=${reqId}`);
       return { ok: false, error: 'Invalid or expired session', code: 401 };
     }
-    if (session.status !== 'pending') {
-      console.log(`[Relay] processProofRequest rejected: session already used — requestId=${reqId}, status=${session.status}`);
-      return { ok: false, error: 'Session already used (replay detected)', code: 409 };
-    }
+    // Whether the session is still unused is decided only by the atomic claim
+    // below (CLAIM_LUA), never by this read.
     if (session.challenge !== challenge) {
       console.log(`[Relay] processProofRequest rejected: challenge mismatch — requestId=${reqId}`);
       return { ok: false, error: 'Challenge mismatch', code: 401 };
@@ -401,6 +455,17 @@ export function createRelay(options: RelayOptions): Relay {
     }
     if (!inputs || typeof inputs !== 'object') {
       return { ok: false, error: 'inputs object is required', code: 400 };
+    }
+    // Absent, null and '' mean "no nonce", as before. Anything else must be a
+    // string: `${nonce}` of any object is "[object Object]", so every object
+    // nonce would have collided with every other.
+    let claimNonce: string | undefined;
+    if (nonce !== undefined && nonce !== null && nonce !== '') {
+      if (typeof nonce !== 'string') return { ok: false, error: 'nonce must be a string', code: 400 };
+      if (Array.from(nonce).length > NONCE_MAX_CHARS) {
+        return { ok: false, error: `nonce must be at most ${NONCE_MAX_CHARS} characters`, code: 400 };
+      }
+      claimNonce = nonce;
     }
 
     // Envelope-level: where control goes back to when the app is done. A bad
@@ -436,22 +501,36 @@ export function createRelay(options: RelayOptions): Relay {
       }
     }
 
-    await updateSession(reqId, { status: 'claimed', circuitId, inputs });
-
-    if (nonce) {
-      const seen = await redis.get(nonceKey(nonce));
-      if (seen) {
-        console.log(`[Relay] processProofRequest rejected: duplicate nonce=${scrubText(nonce)}`);
-        return { ok: false, error: 'Duplicate nonce (replay detected)', code: 409 };
+    // Before the claim, so inputs the relay cannot serialise are a 400 that
+    // leaves the session usable.
+    let hashes: { legacy: string; v2: string };
+    try {
+      hashes = computeInputsHashes(inputs);
+    } catch (err) {
+      if (err instanceof InputsTooDeepError || err instanceof InputsNotJsonError) {
+        return { ok: false, error: err.message, code: 400 };
       }
-      await redis.set(nonceKey(nonce), '1', 'EX', NONCE_TTL);
+      throw err;
     }
+    // Key names only: the values are the user's proof inputs.
+    console.log(`[Relay Hash] requestId=${reqId}, keys=${JSON.stringify(Object.keys(inputs).sort())}, inputsHash=${maskHex(hashes.legacy)}, inputsHashV2=${maskHex(hashes.v2)}`);
+
+    const claim = await claimSession(reqId, claimNonce);
+    if (claim !== 'ok') {
+      console.log(`[Relay] processProofRequest rejected: claim=${claim}, requestId=${reqId}${claim === 'nonce' ? `, nonce=${scrubText(claimNonce!)}` : ''}`);
+      if (claim === 'missing') return { ok: false, error: 'Invalid or expired session', code: 401 };
+      if (claim === 'nonce') return { ok: false, error: 'Duplicate nonce (replay detected)', code: 409 };
+      return { ok: false, error: 'Session already used (replay detected)', code: 409 };
+    }
+    // Informational now; kept so an instance from before CLAIM_LUA, during a
+    // rollout, also sees the session as used.
+    await updateSession(reqId, { status: 'claimed', circuitId, inputs });
 
     const requestId = reqId;
     const nowMs = Date.now();
     const now = new Date(nowMs).toISOString();
 
-    const relayCallbackUrl = `${options.relayExternalUrl || relayBaseUrl || `http://localhost:${options.port}`}/api/v1/proof/callback`;
+    const relayCallbackUrl = callbackUrl;
     console.log(`[Relay] processProofRequest: requestId=${requestId}, callbackUrl=${relayCallbackUrl}`);
 
     const proofRequest: ProofRequest = {
@@ -468,8 +547,8 @@ export function createRelay(options: RelayOptions): Relay {
     };
     console.log(`[Relay] ProofRequest object: ${describeBody(proofRequest)}`);
 
-    const inputsHash = computeInputsHash(inputs);
-    await redis.set(inputsHashKey(requestId), inputsHash, 'EX', STATUS_TTL_SECONDS);
+    await redis.set(inputsHashKey(requestId), hashes.legacy, 'EX', STATUS_TTL_SECONDS);
+    await redis.set(inputsHashV2Key(requestId), hashes.v2, 'EX', STATUS_TTL_SECONDS);
 
     const deepLink = buildDeepLink(proofRequest);
     const status: ProofStatus = { requestId, status: 'pending', deepLink, createdAt: now, updatedAt: now };
@@ -482,7 +561,7 @@ export function createRelay(options: RelayOptions): Relay {
     stats.record(circuitId, 'requested', undefined, undefined, labels);
 
     proofNs.to(room(requestId)).emit('proof:status', { requestId, status: 'pending' });
-    console.log(`[Relay] Proof request created successfully: requestId=${requestId}, circuitId=${circuitId}, inputsHash=${maskHex(inputsHash)}`);
+    console.log(`[Relay] Proof request created successfully: requestId=${requestId}, circuitId=${circuitId}, inputsHash=${maskHex(hashes.legacy)}, inputsHashV2=${maskHex(hashes.v2)}`);
 
     return { ok: true, requestId, deepLink, status };
   }
@@ -504,10 +583,9 @@ export function createRelay(options: RelayOptions): Relay {
 
   app.post('/api/v1/proof/request', rateLimit('request'), async (req: Request, res: Response) => {
     try {
-      const relayBaseUrl = `${req.protocol}://${req.get('host')}`;
-      console.log(`[Relay REST] POST /api/v1/proof/request from IP: ${maskIp(clientIp(req))}, relayBaseUrl=${relayBaseUrl}, ${describeBody(req.body)}`);
+      console.log(`[Relay REST] POST /api/v1/proof/request from IP: ${maskIp(clientIp(req))}, ${describeBody(req.body)}`);
 
-      const result = await processProofRequest(req.body || {}, req.headers.origin, relayBaseUrl);
+      const result = await processProofRequest(req.body || {}, req.headers.origin);
       if (!result.ok) {
         console.log(`[Relay REST] POST /api/v1/proof/request failed: code=${result.code}, error=${scrubText(result.error)}`);
         res.status(result.code).json({ error: result.error });
@@ -552,10 +630,13 @@ export function createRelay(options: RelayOptions): Relay {
         }
       }
 
-      const inputsHash = await redis.get(inputsHashKey(requestId));
+      // Both hashes; see inputsHash.ts for which client reads which. A request
+      // opened by a relay before inputsHashV2 existed has only the legacy one.
+      const [inputsHash, inputsHashV2] = await redis.mget(inputsHashKey(requestId), inputsHashV2Key(requestId));
       if (inputsHash) status.inputsHash = inputsHash;
+      if (inputsHashV2) status.inputsHashV2 = inputsHashV2;
 
-      console.log(`[Relay Poll] Response for ${requestId}: status=${status.status}, errorCode=${status.errorCode}, hasProof=${Boolean(status.proof)}, inputsHash=${maskHex(status.inputsHash)}`);
+      console.log(`[Relay Poll] Response for ${requestId}: status=${status.status}, errorCode=${status.errorCode}, hasProof=${Boolean(status.proof)}, inputsHash=${maskHex(status.inputsHash)}, inputsHashV2=${maskHex(status.inputsHashV2)}`);
       res.json(status);
     } catch (err) {
       console.error(`[Relay Poll] Error: ${scrubError(err)}`);
@@ -563,11 +644,38 @@ export function createRelay(options: RelayOptions): Relay {
     }
   });
 
-  // Callback writes currently rely on possession of a live requestId.
-  // Status/results are transport state, not authorization. Production hardening
-  // requires per-session capability/signature authentication (or equivalent);
-  // consumers must cryptographically verify the ZK proof and expected public inputs.
-  app.post('/api/v1/proof/callback', async (req: Request, res: Response) => {
+  /**
+   * Types of the optional callback fields, and the one rule about content the
+   * relay can check without reading a proof: a `completed` answer carries one.
+   * Until 2026-10-27 any of these could be any JSON value and a `completed`
+   * answer with no proof was delivered to the dApp as a result. Envelope only:
+   * the proof and public inputs are forwarded, never interpreted.
+   */
+  function callbackFieldError(body: Record<string, unknown>): string | null {
+    const { errorCode, error, proof, publicInputs, verifierAddress, chainId, circuit, status } = body;
+    if (errorCode !== undefined && (typeof errorCode !== 'string' || !ERROR_CODE_RE.test(errorCode))) {
+      return 'errorCode must look like E2007 (E followed by four digits)';
+    }
+    if (error !== undefined && typeof error !== 'string') return 'error must be a string';
+    if (proof !== undefined && typeof proof !== 'string') return 'proof must be a string';
+    if (publicInputs !== undefined && !(Array.isArray(publicInputs) && publicInputs.every((p) => typeof p === 'string'))) {
+      return 'publicInputs must be an array of strings';
+    }
+    if (verifierAddress !== undefined && typeof verifierAddress !== 'string') return 'verifierAddress must be a string';
+    if (chainId !== undefined && !(typeof chainId === 'number' && Number.isSafeInteger(chainId) && chainId > 0)) {
+      return 'chainId must be a positive integer';
+    }
+    if (circuit !== undefined && typeof circuit !== 'string') return 'circuit must be a string';
+    if (status === 'completed' && (typeof proof !== 'string' || proof.length === 0 || !Array.isArray(publicInputs))) {
+      return 'a completed answer must carry proof and publicInputs';
+    }
+    return null;
+  }
+
+  // Callback writes rely on possession of a live requestId, which only the
+  // deep link carries. Status/results are transport state, not authorization:
+  // consumers must cryptographically verify the ZK proof and its public inputs.
+  app.post('/api/v1/proof/callback', rateLimit('callback'), async (req: Request, res: Response) => {
     const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
     console.log(`[Relay Callback] <<<< RECEIVED from app. IP: ${maskIp(clientIp(req))}, ${describeBody(body)}`);
     try {
@@ -585,12 +693,10 @@ export function createRelay(options: RelayOptions): Relay {
         });
         return;
       }
-      if (errorCode !== undefined && (typeof errorCode !== 'string' || !ERROR_CODE_RE.test(errorCode))) {
-        res.status(400).json({ error: 'errorCode must look like E2007 (E followed by four digits)' });
-        return;
-      }
-      if (body.error !== undefined && typeof body.error !== 'string') {
-        res.status(400).json({ error: 'error must be a string' });
+      const fieldError = callbackFieldError(body);
+      if (fieldError) {
+        console.log(`[Relay Callback] Rejected: requestId=${requestId}, status=${status}: ${fieldError}`);
+        res.status(400).json({ error: fieldError });
         return;
       }
 
@@ -603,9 +709,19 @@ export function createRelay(options: RelayOptions): Relay {
         return;
       }
 
-      if (!(await lifecycle.getStatus(requestId))) {
+      const meta = await lifecycle.getMeta(requestId);
+      if (!meta || !(await lifecycle.getStatus(requestId))) {
         console.log(`[Relay Callback] Rejected: unknown requestId=${requestId} (not found in Redis — expired or never created)`);
         res.status(404).json({ error: 'Unknown or expired requestId' });
+        return;
+      }
+      // The circuit is part of what the dApp asked for. An answer naming
+      // another circuit is not an answer to this request. Until 2026-10-27 the
+      // relay logged the mismatch and delivered it anyway. The app echoes the
+      // request's own canonical id, so only a tampered or foreign answer differs.
+      if (body.circuit !== undefined && body.circuit !== meta.circuitId) {
+        console.log(`[Relay Callback] Rejected: circuit mismatch requestId=${requestId}, requested=${meta.circuitId}, callback=${scrubText(String(body.circuit))}`);
+        res.status(400).json({ error: `circuit '${String(body.circuit)}' does not match the request's circuit '${meta.circuitId}'` });
         return;
       }
 
@@ -631,6 +747,8 @@ export function createRelay(options: RelayOptions): Relay {
       }
 
       const isError = status === 'error' || status === 'failed';
+      // Every field was type-checked above (callbackFieldError). The circuit is
+      // the one recorded at creation, whether or not the app named it.
       const proofResult: ProofResult = {
         requestId,
         status: status as TerminalStatus,
@@ -640,7 +758,7 @@ export function createRelay(options: RelayOptions): Relay {
         ...(isError && typeof errorCode === 'string' && { errorCode }),
         verifierAddress: body.verifierAddress as string | undefined,
         chainId: body.chainId as number | undefined,
-        circuit: body.circuit as string | undefined,
+        circuit: meta.circuitId,
         completedAt: new Date().toISOString(),
       };
 
@@ -652,10 +770,6 @@ export function createRelay(options: RelayOptions): Relay {
         return;
       }
 
-      const meta = await lifecycle.getMeta(requestId);
-      if (meta && proofResult.circuit !== undefined && proofResult.circuit !== meta.circuitId) {
-        console.log(`[Relay Callback] Circuit mismatch: requestId=${requestId}, requested=${meta.circuitId}, callback=${scrubText(proofResult.circuit)}; stats use the requested circuit`);
-      }
       deliver(proofResult);
       // Where the answer came from, as our own front end resolved it. With no
       // such front end (edge.ts) there is nothing trustworthy to read.
