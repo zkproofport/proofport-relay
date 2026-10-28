@@ -131,6 +131,7 @@ export class Lifecycle {
       verifierAddress: result.verifierAddress,
       chainId: result.chainId,
       circuit: result.circuit,
+      signerVariant: result.signerVariant,
       updatedAt: now,
     } as ProofStatus;
     const won = await this.redis.eval(

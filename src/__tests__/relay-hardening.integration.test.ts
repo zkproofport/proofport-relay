@@ -312,6 +312,11 @@ describe('callback fields', () => {
     ['circuit as a number', { status: 'error', circuit: 1 }, 'circuit must be a string'],
     ['circuit null', { status: 'cancelled', circuit: null }, 'circuit must be a string'],
     ['proof on an error answer as an object', { status: 'error', proof: { x: 1 } }, 'proof must be a string'],
+    ['signerVariant unknown', { status: 'completed', ...PROOF, signerVariant: 'ios' }, 'signerVariant must be one of standard, android, android_factory'],
+    ['signerVariant upper case', { status: 'completed', ...PROOF, signerVariant: 'ANDROID' }, 'signerVariant must be one of standard, android, android_factory'],
+    ['signerVariant empty', { status: 'completed', ...PROOF, signerVariant: '' }, 'signerVariant must be one of standard, android, android_factory'],
+    ['signerVariant null', { status: 'completed', ...PROOF, signerVariant: null }, 'signerVariant must be one of standard, android, android_factory'],
+    ['signerVariant as a number', { status: 'completed', ...PROOF, signerVariant: 1 }, 'signerVariant must be one of standard, android, android_factory'],
   ])('%s: 400, nothing delivered, request still open', async (_name, fields, message) => {
     const url = await start();
     const { requestId } = await createRequest(url);
@@ -361,6 +366,49 @@ describe('callback fields', () => {
     expect((await callback(url, answer)).status).toBe(200);
     await new Promise((r) => setTimeout(r, 200));
     expect(results[0]).toMatchObject({ status: 'completed', circuit: 'coinbase_attestation', chainId: 8453 });
+  });
+});
+
+describe('signerVariant: carried from the app to the dApp unchanged', () => {
+  it.each(['standard', 'android', 'android_factory'])('%s: in the socket result, the poll response, and a late subscriber\'s replay', async (variant) => {
+    const url = await start();
+    const { requestId } = await createRequest(url);
+    const results = await dappSocket(url, requestId);
+    expect((await callback(url, { requestId, status: 'completed', ...PROOF, signerVariant: variant })).status).toBe(200);
+    await settle();
+    expect(results).toHaveLength(1);
+    expect(results[0].signerVariant).toBe(variant);
+    const polled = await poll(url, requestId);
+    expect(polled.body).toMatchObject({ status: 'completed', signerVariant: variant });
+    // A subscriber arriving after the answer gets the buffered proof:result
+    // (and no proof:status, which is why dappSocket() cannot be used here).
+    const late = connectSocket(`${url}/proof`, { path: '/socket.io', transports: ['websocket'], forceNew: true });
+    sockets.push(late);
+    const replayed = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      late.once('connect_error', reject);
+      late.once('proof:result', resolve);
+      late.on('connect', () => late.emit('proof:subscribe', { requestId }));
+    });
+    expect(replayed.signerVariant).toBe(variant);
+  });
+
+  it('absent: no signerVariant key anywhere (the SDK then uses the standard verifier)', async () => {
+    const url = await start();
+    const { requestId } = await createRequest(url);
+    const results = await dappSocket(url, requestId);
+    expect((await callback(url, { requestId, status: 'completed', ...PROOF })).status).toBe(200);
+    await settle();
+    expect(results[0]).not.toHaveProperty('signerVariant');
+    expect((await poll(url, requestId)).body).not.toHaveProperty('signerVariant');
+  });
+
+  it('an invalid value is refused and the request stays open for a valid answer', async () => {
+    const url = await start();
+    const { requestId } = await createRequest(url);
+    expect((await callback(url, { requestId, status: 'completed', ...PROOF, signerVariant: 'android-factory' })).status).toBe(400);
+    expect((await poll(url, requestId)).body.status).toBe('pending');
+    expect((await callback(url, { requestId, status: 'completed', ...PROOF, signerVariant: 'android_factory' })).status).toBe(200);
+    expect((await poll(url, requestId)).body.signerVariant).toBe('android_factory');
   });
 });
 

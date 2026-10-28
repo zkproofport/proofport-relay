@@ -136,6 +136,7 @@ const ENVELOPE_FIELDS = [
   'dappName',
   'chainId',
   'returnScheme',
+  'signerVariant',
 ] as const;
 
 /**

@@ -43,6 +43,18 @@ export const APP_TERMINAL_STATUSES = ['completed', 'error', 'failed', 'cancelled
 /** Non-terminal statuses the app may report while it works. */
 export const INTERMEDIATE_STATUSES = ['generating'] as const;
 
+/**
+ * Which circuit package (and so which verifier) made a proof, as the app
+ * reports it on its callback. The dApp passes it to the SDK unchanged to pick
+ * the verifier; the relay only checks it is one of these words and carries it.
+ *   standard         the circuit's standard package
+ *   android          Android key attestation
+ *   android_factory  factory-provisioned Android key attestation together
+ *                    with a Play Integrity verdict
+ */
+export const SIGNER_VARIANTS = ['standard', 'android', 'android_factory'] as const;
+export type SignerVariant = typeof SIGNER_VARIANTS[number];
+
 export interface ProofResult {
   requestId: string;
   status: TerminalStatus;
@@ -54,6 +66,8 @@ export interface ProofResult {
   verifierAddress?: string;
   chainId?: number;
   circuit?: string;
+  /** The app's report of which package made the proof (SIGNER_VARIANTS). */
+  signerVariant?: SignerVariant;
   completedAt: string;
 }
 
@@ -82,6 +96,7 @@ export interface ProofStatus {
   verifierAddress?: string;
   chainId?: number;
   circuit?: string;
+  signerVariant?: SignerVariant;
   deepLink?: string;
   /** Legacy hash shipped apps recompute (inputsHash.ts). */
   inputsHash?: string;

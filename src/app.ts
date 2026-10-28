@@ -7,8 +7,8 @@ import { v4 as uuidv4 } from 'uuid';
 import type Redis from 'ioredis';
 import { ethers } from 'ethers';
 import { isCircuitId, ALL_CIRCUIT_IDS } from '@zkproofport-app/core/circuits';
-import type { ProofRequest, ProofResult, ProofSession, ProofStatus, RequestMeta, TerminalStatus } from './types';
-import { APP_TERMINAL_STATUSES, INTERMEDIATE_STATUSES, TERMINAL_STATUSES } from './types';
+import type { ProofRequest, ProofResult, ProofSession, ProofStatus, RequestMeta, SignerVariant, TerminalStatus } from './types';
+import { APP_TERMINAL_STATUSES, INTERMEDIATE_STATUSES, SIGNER_VARIANTS, TERMINAL_STATUSES } from './types';
 import { validateReturnScheme } from './returnScheme';
 import { NEEDS_WALLET_SIGNATURE } from './signaturePolicy';
 import { Lifecycle, STATUS_TTL_SECONDS } from './lifecycle';
@@ -726,6 +726,7 @@ export function createRelay(options: RelayOptions): Relay {
           status.verifierAddress = result.verifierAddress;
           status.chainId = result.chainId;
           status.circuit = result.circuit;
+          status.signerVariant = result.signerVariant;
         }
       }
 
@@ -751,7 +752,7 @@ export function createRelay(options: RelayOptions): Relay {
    * the proof and public inputs are forwarded, never interpreted.
    */
   function callbackFieldError(body: Record<string, unknown>): string | null {
-    const { errorCode, error, proof, publicInputs, verifierAddress, chainId, circuit, status } = body;
+    const { errorCode, error, proof, publicInputs, verifierAddress, chainId, circuit, status, signerVariant } = body;
     if (errorCode !== undefined && (typeof errorCode !== 'string' || !ERROR_CODE_RE.test(errorCode))) {
       return 'errorCode must look like E2007 (E followed by four digits)';
     }
@@ -765,6 +766,11 @@ export function createRelay(options: RelayOptions): Relay {
       return 'chainId must be a positive integer';
     }
     if (circuit !== undefined && typeof circuit !== 'string') return 'circuit must be a string';
+    // Which verifier the dApp should use. A word from a closed list, carried
+    // unchanged; the relay never checks it against the proof.
+    if (signerVariant !== undefined && !isOneOf(SIGNER_VARIANTS, signerVariant)) {
+      return `signerVariant must be one of ${SIGNER_VARIANTS.join(', ')}`;
+    }
     if (status === 'completed' && (typeof proof !== 'string' || proof.length === 0 || !Array.isArray(publicInputs))) {
       return 'a completed answer must carry proof and publicInputs';
     }
@@ -858,6 +864,7 @@ export function createRelay(options: RelayOptions): Relay {
         verifierAddress: body.verifierAddress as string | undefined,
         chainId: body.chainId as number | undefined,
         circuit: meta.circuitId,
+        ...(body.signerVariant !== undefined && { signerVariant: body.signerVariant as SignerVariant }),
         completedAt: new Date().toISOString(),
       };
 
@@ -876,7 +883,7 @@ export function createRelay(options: RelayOptions): Relay {
       countOutcome(meta, proofResult, country);
 
       res.json({ received: true });
-      console.log(`[Relay Callback] Successfully processed: requestId=${requestId}, status=${status}, errorCode=${proofResult.errorCode}, circuit=${scrubText(proofResult.circuit)}, chainId=${proofResult.chainId}`);
+      console.log(`[Relay Callback] Successfully processed: requestId=${requestId}, status=${status}, errorCode=${proofResult.errorCode}, circuit=${scrubText(proofResult.circuit)}, chainId=${proofResult.chainId}, signerVariant=${proofResult.signerVariant}`);
     } catch (err) {
       console.error(`[Relay Callback] Error: ${scrubError(err)}`);
       res.status(500).json({ error: 'Internal server error' });

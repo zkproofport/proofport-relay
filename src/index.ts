@@ -47,7 +47,8 @@ const RELAY_EXTERNAL_URL = parseRelayExternalUrl(process.env.RELAY_EXTERNAL_URL,
  * Keys for POST /api/v1/play-integrity/decrypt (playIntegrity.ts). Either one
  * absent disables that endpoint only (503 naming it); a malformed one stops
  * the relay here. Deployed environments get both from Google Secret Manager
- * (play-integrity-decryption-key-<env>, play-integrity-verification-key-<env>),
+ * (play-integrity-decryption-key, play-integrity-verification-key: one pair for
+ * the app, shared by staging and production),
  * mounted by .github/workflows/deploy.yml.
  */
 const PLAY_INTEGRITY = playIntegrityConfigFromEnv(process.env);

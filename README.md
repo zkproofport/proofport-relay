@@ -96,8 +96,8 @@ Environment variables (see `.env.example`):
 | `RELAY_STATS_TOKEN` | (required, ≥ 32 chars) | Bearer token for `GET /api/v1/stats`. The relay refuses to start without it. Locally `scripts/dev.sh` generates one into `.env.development`; deployed environments read the Google Secret Manager secrets `relay-stats-token-staging` / `relay-stats-token-production` (mounted by `deploy.yml` with `--set-secrets`; GitHub secrets are write-only, so the token could never be read back to call the API) |
 | `RELAY_EDGE` | (required) | What sits in front of the relay (`src/edge.ts`): `cloud-run-domain` (Cloud Run domain mapping, 1 proxy hop, no country), `load-balancer` (external Application Load Balancer, 2 hops, country from `X-Relay-Client-Region`), `local` (Docker, 1 hop, headers believed for tests). Decides which `X-Forwarded-For` entry is the caller and whether the country header is trusted |
 | `NODE_ENV` | `development` | Environment mode |
-| `PLAY_INTEGRITY_DECRYPTION_KEY` | (optional) | Play Console's response-encryption decryption key: standard base64 of 32 bytes (AES-256). With `PLAY_INTEGRITY_VERIFICATION_KEY`, enables `POST /api/v1/play-integrity/decrypt`. If either is unset the relay starts, logs once that the endpoint is disabled, and the endpoint answers 503 naming the missing variable; there is no default key. A value that is present but malformed stops the relay at startup. Deployed environments read the Google Secret Manager secrets `play-integrity-decryption-key-<env>`, mounted by `deploy.yml` when that environment's `PLAY_INTEGRITY` row is `on` |
-| `PLAY_INTEGRITY_VERIFICATION_KEY` | (optional) | Play Console's response-encryption verification key: standard base64 of a DER X.509 SubjectPublicKeyInfo, EC P-256. Secret Manager `play-integrity-verification-key-<env>` |
+| `PLAY_INTEGRITY_DECRYPTION_KEY` | (optional) | Play Console's response-encryption decryption key: standard base64 of 32 bytes (AES-256). With `PLAY_INTEGRITY_VERIFICATION_KEY`, enables `POST /api/v1/play-integrity/decrypt`. If either is unset the relay starts, logs once that the endpoint is disabled, and the endpoint answers 503 naming the missing variable; there is no default key. A value that is present but malformed stops the relay at startup. Deployed environments read the Google Secret Manager secret `play-integrity-decryption-key` (one key pair for the app, shared by staging and production), mounted by `deploy.yml` when that environment's `PLAY_INTEGRITY` row is `on` |
+| `PLAY_INTEGRITY_VERIFICATION_KEY` | (optional) | Play Console's response-encryption verification key: standard base64 of a DER X.509 SubjectPublicKeyInfo, EC P-256. Secret Manager `play-integrity-verification-key` |
 
 ## API Reference
 
@@ -297,6 +297,7 @@ Receive proof completion callback from mobile app.
 | `publicInputs` | Array of strings (may be empty). Required on `completed` |
 | `verifierAddress` | Optional string |
 | `chainId` | Optional positive safe integer |
+| `signerVariant` | Optional: `standard`, `android` or `android_factory` -- which circuit package made the proof. Anything else (including `null` and `''`) is 400 naming the allowed values. Carried unchanged into the result (`proof:result`, the poll response, a replay); the dApp passes it to the SDK to pick the verifier. Never checked against the proof |
 
 Every optional field, when present, must have its type: `null` is not "absent" and is 400. Other fields the app sends (`nullifier`, `inputs`, timestamps) are ignored.
 
