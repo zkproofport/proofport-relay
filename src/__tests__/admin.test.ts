@@ -48,6 +48,7 @@ async function startRelay(opts: { statsAuth?: StatsAuthGuard } = {}): Promise<{ 
     relayExternalUrl: TEST_EXTERNAL_URL,
     deadlineMs: 3_600_000,
     sweepIntervalMs: 3_600_000,
+    playIntegrity: { enabled: false, missing: ['PLAY_INTEGRITY_DECRYPTION_KEY', 'PLAY_INTEGRITY_VERIFICATION_KEY'] },
   });
   await new Promise<void>((resolve) => relay.httpServer.listen(0, '127.0.0.1', resolve));
   closers.push(() => relay.close());

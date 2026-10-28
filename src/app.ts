@@ -21,6 +21,7 @@ import { createStatsAuthGuard, STATS_AUTH_MAX_FAILURES, StatsAuthGuard } from '.
 import { mountAdmin } from './admin';
 import { computeInputsHashes, InputsNotJsonError, InputsTooDeepError } from './inputsHash';
 import { parseRelayExternalUrl } from './externalUrl';
+import { decryptPlayIntegrityToken, PlayIntegrityConfig, PlayIntegrityError, PlayIntegrityReason, playIntegrityMessage } from './playIntegrity';
 
 /**
  * How long the relay waits for the app before it answers the dApp itself.
@@ -116,7 +117,21 @@ const RATE_LIMITS = {
   callback: { windowMs: 60_000, max: 60 },
   /** Authenticated stats reads. Wrong tokens are limited separately (statsAuth.ts). */
   stats: { windowMs: 60_000, max: 60 },
+  /**
+   * POST /api/v1/play-integrity/decrypt. The app sends one token per proof it
+   * is about to generate; 30 a minute leaves room for many phones behind one
+   * carrier NAT while keeping the AES and ECDSA work per address bounded.
+   */
+  playIntegrity: { windowMs: 60_000, max: 30 },
 };
+
+/**
+ * Body cap for POST /api/v1/play-integrity/decrypt. A classic Play Integrity
+ * token is a compact JWE of a signed verdict, a few kilobytes; 16 KB leaves
+ * headroom for the optional verdict fields without letting anyone park a
+ * megabyte per request on the decryption path. Larger bodies get 413.
+ */
+export const PLAY_INTEGRITY_BODY_LIMIT = '16kb';
 
 /**
  * Paths no other origin may call from a browser: the admin page and the
@@ -158,6 +173,12 @@ export interface RelayOptions {
   relayExternalUrl: string;
   deadlineMs: number;
   sweepIntervalMs: number;
+  /**
+   * Keys for POST /api/v1/play-integrity/decrypt (playIntegrity.ts). Required
+   * so every caller decides; `{ enabled: false, missing }` turns the endpoint
+   * into a 503 naming the missing variables and leaves everything else alone.
+   */
+  playIntegrity: PlayIntegrityConfig;
 }
 
 export interface Relay {
@@ -211,6 +232,9 @@ export function createRelay(options: RelayOptions): Relay {
     if (SAME_ORIGIN_ONLY.some((re) => re.test(req.path))) return next();
     corsMiddleware(req, res, next);
   });
+  // Mounted before the general JSON parser so its own, much smaller body cap
+  // applies (a parsed body is not parsed again).
+  app.use('/api/v1/play-integrity', playIntegrityRouter());
   app.use(express.json({ limit: '1mb' }));
 
   const io = new Server(httpServer, {
@@ -262,6 +286,81 @@ export function createRelay(options: RelayOptions): Relay {
     }
   }, 300_000);
   rateLimitCleanup.unref();
+
+  // -------------------------------------------------------------------------
+  // Play Integrity token decryption (playIntegrity.ts)
+  //
+  // Nothing from the token, the decrypted header, payload or signature, the
+  // nonce or any verdict field reaches a log line: only the caller's masked
+  // address, the body's key names, the token's length and the outcome.
+  // -------------------------------------------------------------------------
+  function playIntegrityRouter(): express.Router {
+    const router = express.Router();
+    const config = options.playIntegrity;
+    const log = (req: Request, outcome: string, detail: string) =>
+      console.log(`[Relay PlayIntegrity] POST /api/v1/play-integrity/decrypt from IP: ${maskIp(clientIp(req))}, outcome=${outcome}${detail}`);
+    const refuse = (req: Request, res: Response, status: number, reason: PlayIntegrityReason, detail: string) => {
+      log(req, reason, detail);
+      res.status(status).json({ error: playIntegrityMessage(reason), reason });
+    };
+
+    router.use(rateLimit('playIntegrity'));
+    router.use(express.json({ limit: PLAY_INTEGRITY_BODY_LIMIT }));
+
+    router.post('/decrypt', (req: Request, res: Response) => {
+      res.setHeader('Cache-Control', 'no-store');
+      if (!config.enabled) {
+        log(req, 'not_configured', `, missing=${config.missing.join(',')}`);
+        res.status(503).json({
+          error: `Play Integrity token decryption is not configured on this relay: ${config.missing.join(' and ')} not set`,
+          reason: 'not_configured',
+          missing: config.missing,
+        });
+        return;
+      }
+      // describeBody prints key names and envelope fields only; `token` is
+      // neither, so its value never appears.
+      const body = req.body as unknown;
+      const summary = `, ${describeBody(body)}`;
+      const token = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).token : undefined;
+      if (token === undefined || token === null || token === '') return refuse(req, res, 400, 'token_missing', summary);
+      if (typeof token !== 'string') return refuse(req, res, 400, 'token_not_string', summary);
+      const detail = `${summary}, tokenChars=${token.length}`;
+      try {
+        const jws = decryptPlayIntegrityToken(token, config);
+        log(req, 'ok', `${detail}, headerChars=${jws.protectedHeader.length}, payloadChars=${jws.payload.length}`);
+        res.json(jws);
+      } catch (err) {
+        if (err instanceof PlayIntegrityError) {
+          // A signature that does not verify is a well-formed token the relay
+          // will not vouch for: 422, so the app can tell it from a broken one.
+          return refuse(req, res, err.reason === 'signature_invalid' ? 422 : 400, err.reason, detail);
+        }
+        // Name only: an unexpected crypto error's message is not ours to vet.
+        console.error(`[Relay PlayIntegrity] Unexpected error (${err instanceof Error ? err.name : typeof err})${detail}`);
+        res.status(500).json({ error: 'Internal server error' });
+      }
+    });
+
+    // Body-parser errors on this path. Its SyntaxError quotes the body it could
+    // not parse, so only the error type is logged, never the message.
+    router.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+      if (res.headersSent) return next(err);
+      const status = (err as { status?: number })?.status;
+      const type = (err as { type?: unknown })?.type;
+      log(req, `body_error_${status}`, `, type=${typeof type === 'string' ? type : 'unknown'}`);
+      if (status === 413) {
+        res.status(413).json({ error: `Request body too large (limit ${PLAY_INTEGRITY_BODY_LIMIT})`, reason: 'body_too_large' });
+        return;
+      }
+      if (typeof status === 'number' && status >= 400 && status < 500) {
+        res.status(status).json({ error: 'Malformed request body', reason: 'body_malformed' });
+        return;
+      }
+      res.status(500).json({ error: 'Internal server error' });
+    });
+    return router;
+  }
 
   // -------------------------------------------------------------------------
   // Sessions

@@ -80,6 +80,7 @@ async function start(opts: {
     relayExternalUrl: TEST_EXTERNAL_URL,
     deadlineMs: opts.deadlineMs ?? LONG,
     sweepIntervalMs: opts.sweepIntervalMs ?? LONG,
+    playIntegrity: { enabled: false, missing: ['PLAY_INTEGRITY_DECRYPTION_KEY', 'PLAY_INTEGRITY_VERIFICATION_KEY'] },
   });
   await new Promise<void>((resolve) => relay.httpServer.listen(0, '127.0.0.1', resolve));
   const { port } = relay.httpServer.address() as AddressInfo;

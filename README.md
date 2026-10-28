@@ -96,6 +96,8 @@ Environment variables (see `.env.example`):
 | `RELAY_STATS_TOKEN` | (required, ≥ 32 chars) | Bearer token for `GET /api/v1/stats`. The relay refuses to start without it. Locally `scripts/dev.sh` generates one into `.env.development`; deployed environments read the Google Secret Manager secrets `relay-stats-token-staging` / `relay-stats-token-production` (mounted by `deploy.yml` with `--set-secrets`; GitHub secrets are write-only, so the token could never be read back to call the API) |
 | `RELAY_EDGE` | (required) | What sits in front of the relay (`src/edge.ts`): `cloud-run-domain` (Cloud Run domain mapping, 1 proxy hop, no country), `load-balancer` (external Application Load Balancer, 2 hops, country from `X-Relay-Client-Region`), `local` (Docker, 1 hop, headers believed for tests). Decides which `X-Forwarded-For` entry is the caller and whether the country header is trusted |
 | `NODE_ENV` | `development` | Environment mode |
+| `PLAY_INTEGRITY_DECRYPTION_KEY` | (optional) | Play Console's response-encryption decryption key: standard base64 of 32 bytes (AES-256). With `PLAY_INTEGRITY_VERIFICATION_KEY`, enables `POST /api/v1/play-integrity/decrypt`. If either is unset the relay starts, logs once that the endpoint is disabled, and the endpoint answers 503 naming the missing variable; there is no default key. A value that is present but malformed stops the relay at startup. Deployed environments read the Google Secret Manager secrets `play-integrity-decryption-key-<env>`, mounted by `deploy.yml` when that environment's `PLAY_INTEGRITY` row is `on` |
+| `PLAY_INTEGRITY_VERIFICATION_KEY` | (optional) | Play Console's response-encryption verification key: standard base64 of a DER X.509 SubjectPublicKeyInfo, EC P-256. Secret Manager `play-integrity-verification-key-<env>` |
 
 ## API Reference
 
@@ -374,6 +376,45 @@ Admin dashboard for the statistics above: log in with the stats token, pick a ra
 - **What is served.** `GET /admin` (HTML), `/admin/admin.css`, `/admin/app.mjs`, `/admin/core.mjs` -- read from `src/admin/` (copied to `dist/admin/` by `npm run build`) once at startup; a relay built without them refuses to start. Anything else under `/admin` is 404. No external CDN, framework or build step.
 - **Headers** on all of them: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` (no inline script or style), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, `X-Robots-Tag: noindex`. Every value from the API is written with `textContent`, never `innerHTML`.
 
+#### POST /api/v1/play-integrity/decrypt
+Opens a classic Google Play Integrity token for the app. Google returns the token as a compact JWE (`alg` `A256KW`, `enc` `A256GCM`) whose plaintext is a compact JWS (`ES256`) over the integrity verdict. The relay decrypts it with the app's decryption key and returns the JWS segments exactly as Google signed them, so the app can rebuild the signing input byte for byte; the proof circuit verifies Google's signature itself. The relay also checks the signature with the verification key and refuses a token that does not verify, so the app learns early, but the in-circuit check is what the verdict's integrity rests on. The relay does not parse or read the verdict.
+
+**Rate limit:** 30 requests per minute per IP. **Body limit:** 16 KB (413 above it).
+
+**Request:**
+```json
+{ "token": "<compact JWE from Play Integrity>" }
+```
+
+**Response (200):** each value is the base64url segment of the JWS, unmodified.
+```json
+{
+  "protectedHeader": "<base64url JWS protected header>",
+  "payload": "<base64url JWS payload>",
+  "signature": "<base64url, 64-byte r||s>"
+}
+```
+
+**Errors:** `{ "error": "<message>", "reason": "<code>" }`, never quoting the token.
+
+| Status | `reason` | Meaning |
+|--------|----------|---------|
+| 400 | `token_missing` | `token` absent, `null` or empty |
+| 400 | `token_not_string` | `token` is not a string |
+| 400 | `token_malformed` | not a compact JWE (five canonical base64url segments, JSON header, AES key-wrap and GCM segment sizes) |
+| 400 | `jwe_unsupported` | JWE `alg` is not `A256KW`, `enc` is not `A256GCM`, or the header has `zip` or `crit` |
+| 400 | `key_unwrap_failed` | the content key does not unwrap with this app's decryption key |
+| 400 | `decrypt_failed` | AES-GCM authentication failed (ciphertext, IV, tag or protected header altered) |
+| 400 | `not_a_jws` | the decrypted content is not a compact JWS |
+| 400 | `jws_unsupported` | JWS `alg` is not `ES256`, or the header has `crit` |
+| 422 | `signature_invalid` | the ES256 signature is not 64 bytes or does not verify with the verification key |
+| 400 | `body_malformed` | the body is not valid JSON |
+| 413 | `body_too_large` | body over 16 KB |
+| 429 | — | rate limit (`Retry-After` set) |
+| 503 | `not_configured` | a key variable is unset; the response's `missing` array names it |
+
+Responses carry `Cache-Control: no-store`. Logs show the caller's masked address, the body's key names, lengths and the outcome code only.
+
 #### GET /health
 Health check endpoint.
 
@@ -476,6 +517,7 @@ Per caller address, in memory, per instance, fixed 1-minute windows:
 | `POST /api/v1/proof/request` and Socket.IO `proof:request` (one shared budget) | 10 requests | 1 minute per IP |
 | `POST /api/v1/proof/callback` | 60 requests | 1 minute per IP |
 | `GET /api/v1/stats` (authenticated) | 60 requests | 1 minute per IP |
+| `POST /api/v1/play-integrity/decrypt` | 30 requests | 1 minute per IP |
 | `GET /api/v1/stats` wrong token | 10 failures, then locked | 15 minutes per IP, across all instances (Redis) |
 
 Exceeding limits returns HTTP 429 with `Retry-After` (a socket gets `proof:error` with `code: 429`).
@@ -751,6 +793,7 @@ interface ProofResult {
 | Callback after the relay timed the request out | 409 | `{ "error": "The request timed out before the app answered", "reason": "expired" }` |
 | Malformed `errorCode` | 400 | `errorCode must look like E2007 (E followed by four digits)` |
 | Stats without / with wrong token | 401 | `Unauthorized` |
+| Play Integrity token refused | 400 / 422 / 413 / 503 | `{ "error": "...", "reason": "..." }` -- see [POST /api/v1/play-integrity/decrypt](#post-apiv1play-integritydecrypt) |
 | Rate limit exceeded | 429 | `Too many requests. Please try again later.` |
 
 ## Performance

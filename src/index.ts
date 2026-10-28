@@ -6,6 +6,7 @@ import { createStatsRecorder } from './stats';
 import { edgeFor } from './edge';
 import { parseRelayExternalUrl } from './externalUrl';
 import { scrubError, scrubText } from './mask';
+import { playIntegrityConfigFromEnv } from './playIntegrity';
 
 dotenv.config();
 
@@ -42,6 +43,18 @@ const EDGE = edgeFor(process.env.RELAY_EDGE);
  */
 const RELAY_EXTERNAL_URL = parseRelayExternalUrl(process.env.RELAY_EXTERNAL_URL, EDGE);
 
+/**
+ * Keys for POST /api/v1/play-integrity/decrypt (playIntegrity.ts). Either one
+ * absent disables that endpoint only (503 naming it); a malformed one stops
+ * the relay here. Deployed environments get both from Google Secret Manager
+ * (play-integrity-decryption-key-<env>, play-integrity-verification-key-<env>),
+ * mounted by .github/workflows/deploy.yml.
+ */
+const PLAY_INTEGRITY = playIntegrityConfigFromEnv(process.env);
+if (!PLAY_INTEGRITY.enabled) {
+  console.warn(`[Relay] Play Integrity token decryption disabled: ${PLAY_INTEGRITY.missing.join(' and ')} not set; POST /api/v1/play-integrity/decrypt answers 503`);
+}
+
 function connect(name: string): Redis {
   const client = new Redis(REDIS_URL!, {
     maxRetriesPerRequest: 3,
@@ -75,12 +88,14 @@ async function main() {
     relayExternalUrl: RELAY_EXTERNAL_URL,
     deadlineMs: REQUEST_DEADLINE_MS,
     sweepIntervalMs: SWEEP_INTERVAL_MS,
+    playIntegrity: PLAY_INTEGRITY,
   });
 
   relay.httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[Relay] Server running on port ${PORT}`);
     console.log(`[Relay] Socket.IO namespace: /proof (Redis adapter)`);
     console.log(`[Relay] Edge: RELAY_EDGE=${process.env.RELAY_EDGE} (proxy hops ${EDGE.proxyHops}, country header ${EDGE.regionHeader ?? 'none'})`);
+    console.log(`[Relay] Play Integrity token decryption: ${PLAY_INTEGRITY.enabled ? 'enabled' : 'disabled'}`);
     console.log(`[Relay] Request deadline ${REQUEST_DEADLINE_MS}ms, sweep every ${SWEEP_INTERVAL_MS}ms`);
   });
 }

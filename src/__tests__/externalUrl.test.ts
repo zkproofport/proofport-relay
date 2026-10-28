@@ -76,6 +76,7 @@ describe('RELAY_EXTERNAL_URL', () => {
       edge: EDGES.local,
       deadlineMs: 1000,
       sweepIntervalMs: 1000,
+      playIntegrity: { enabled: false as const, missing: ['PLAY_INTEGRITY_DECRYPTION_KEY', 'PLAY_INTEGRITY_VERIFICATION_KEY'] },
     };
     expect(() => createRelay({ ...base, relayExternalUrl: '' })).toThrow(/RELAY_EXTERNAL_URL environment variable is required/);
     expect(() => createRelay({ ...base, relayExternalUrl: 'https://relay.example/' })).toThrow(/exactly an origin/);
