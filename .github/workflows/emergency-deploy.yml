@@ -234,14 +234,37 @@ jobs:
             --format='value(status.latestReadyRevisionName)')
           TRAFFIC=$(gcloud run services describe "$SERVICE" --region "$REGION" \
             --format='value(status.traffic[0].revisionName,status.traffic[0].percent)')
-          IMAGE=$(gcloud run revisions describe "$REVISION" --region "$REGION" \
-            --format='value(spec.containers[0].image)')
+          TEMPLATE_IMAGE=$(gcloud run services describe "$SERVICE" --region "$REGION" \
+            --format='value(spec.template.spec.containers[0].image)')
+          # A revision records the platform manifest digest the tag resolved to,
+          # not the tag; the tag points at an index (platform image +
+          # attestation), so look the revision's digest up inside that index.
+          REVISION_DIGEST=$(gcloud run revisions describe "$REVISION" --region "$REGION" \
+            --format='value(status.imageDigest)' | sed 's/.*@//')
           echo "Revision: $REVISION"
           echo "Traffic:  $TRAFFIC"
-          case "$IMAGE" in
-            *":${ENV}-${SHA}") echo "Image tag carries $SHA" ;;
-            *) echo "Revision $REVISION runs an image whose tag is not ${ENV}-${SHA}" >&2; exit 1 ;;
+          echo "Digest:   $REVISION_DIGEST"
+          case "$TEMPLATE_IMAGE" in
+            *":${ENV}-${SHA}") ;;
+            *) echo "Service template image tag is not ${ENV}-${SHA}" >&2; exit 1 ;;
           esac
+          case "$TRAFFIC" in
+            "${REVISION}"*100) ;;
+            *) echo "Traffic is not 100% on $REVISION: $TRAFFIC" >&2; exit 1 ;;
+          esac
+          REPO_PATH=${TEMPLATE_IMAGE%:*}
+          HOST=${REPO_PATH%%/*}
+          NAME=${REPO_PATH#*/}
+          TOKEN=$(gcloud auth print-access-token)
+          INDEX=$(curl -fsS -D - -H "Authorization: Bearer $TOKEN" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+            "https://${HOST}/v2/${NAME}/manifests/${ENV}-${SHA}")
+          if ! printf '%s' "$INDEX" | grep -qi "$REVISION_DIGEST"; then
+            # (-D - puts the tag's own Docker-Content-Digest in INDEX too)
+            echo "Revision digest $REVISION_DIGEST is not in tag ${ENV}-${SHA}" >&2
+            exit 1
+          fi
+          echo "Revision $REVISION runs tag ${ENV}-${SHA}"
           for i in $(seq 1 10); do
             BODY=$(curl -fsS -m 10 "${RELAY_EXTERNAL_URL}/health" || true)
             if printf '%s' "$BODY" | grep -q '"status":"ok"'; then
