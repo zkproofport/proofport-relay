@@ -32,7 +32,8 @@
 #
 # Repository secrets (Settings > Secrets and variables > Actions):
 #   GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT, GCP_REGION,
-#   GCP_ARTIFACT_REGISTRY, GCP_VPC_CONNECTOR, STAGING_REDIS_URL
+#   GCP_ARTIFACT_REGISTRY, GCP_VPC_CONNECTOR, GCP_PROJECT, GCP_PROJECT_NUMBER,
+#   STAGING_REDIS_URL
 # They are secrets (not variables) so this public repository's run logs mask
 # them.
 
@@ -68,6 +69,21 @@ jobs:
     name: Deploy relay ${{ inputs.environment }}
     runs-on: ubuntu-latest
     steps:
+      # The auth step exports the project id (taken from the service account)
+      # into every later step's environment, and gcloud prints the project
+      # number in service URLs. This repository's logs are public; mask both.
+      - name: Mask project identifiers
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_PROJECT_NUMBER: ${{ secrets.GCP_PROJECT_NUMBER }}
+        run: |
+          if [ -z "$GCP_PROJECT" ] || [ -z "$GCP_PROJECT_NUMBER" ]; then
+            echo "GCP_PROJECT and GCP_PROJECT_NUMBER secrets are required" >&2
+            exit 1
+          fi
+          echo "::add-mask::$GCP_PROJECT"
+          echo "::add-mask::$GCP_PROJECT_NUMBER"
+
       - name: Refuse anything but main
         run: |
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
