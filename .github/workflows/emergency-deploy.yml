@@ -1,0 +1,263 @@
+# Emergency relay deploy -- FALLBACK ONLY.
+#
+# Why this exists: on 2026-10-28 the monorepo that normally deploys the relay
+# could not run GitHub Actions at all (an organisation billing problem refused
+# every job in private repositories). This repository is public, so its jobs
+# still run. Use this workflow only while the normal path is unavailable.
+#
+# The normal path is the monorepo's `deploy.yml` (service `relay`). Return to it
+# as soon as it runs again. Its next run must use a relay commit that contains
+# whatever this workflow deployed, or it rolls the relay back.
+#
+# Environments: `staging` only. The `production` row exists so the table has the
+# same shape as `deploy.yml`, and is refused until someone deliberately enables
+# it here (and widens the workload identity provider, which is restricted to
+# this file on `main` triggered by workflow_dispatch).
+#
+# KEEP IN SYNC with the monorepo's deploy.yml (relay parts). Anything that
+# differs makes switching back change the running service:
+#   - image build: context = this repository root, Dockerfile.prod,
+#     platform linux/amd64, tags `<env>-<sha>` and `<env>-latest`
+#     (here <sha> is this repository's commit; there it is the monorepo's)
+#   - Cloud Run service name proofport-relay-<env>, region, port 4001, cpu 1,
+#     memory 512Mi, min-instances 1, max-instances (staging 5, production 20),
+#     --allow-unauthenticated, --session-affinity,
+#     VPC connector + --vpc-egress private-ranges-only
+#   - env vars NODE_ENV, REDIS_URL, RELAY_EXTERNAL_URL, RELAY_EDGE, and the
+#     per-environment RELAY_EDGE / RELAY_INGRESS / RELAY_EXTERNAL_URL rows
+#   - secret mounts RELAY_STATS_TOKEN=relay-stats-token-<env>:latest and, when
+#     the environment's PLAY_INTEGRITY row is `on`,
+#     PLAY_INTEGRITY_DECRYPTION_KEY / PLAY_INTEGRITY_VERIFICATION_KEY
+#   - deployer identity (same service account as deploy.yml)
+#
+# Repository secrets (Settings > Secrets and variables > Actions):
+#   GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT, GCP_REGION,
+#   GCP_ARTIFACT_REGISTRY, GCP_VPC_CONNECTOR, STAGING_REDIS_URL
+# They are secrets (not variables) so this public repository's run logs mask
+# them.
+
+name: Emergency deploy (fallback)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment (staging only; production is refused)'
+        required: true
+        type: choice
+        options:
+          - staging
+      deployed_relay_sha:
+        description: >-
+          Relay commit currently running, when the running image was built by
+          the monorepo (its tag then carries a monorepo commit). Resolve with
+          `git ls-tree <monorepo-sha> proofport-relay`. Leave empty otherwise.
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: emergency-deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy relay ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse anything but main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Refusing to deploy from $GITHUB_REF; only refs/heads/main deploys." >&2
+            exit 1
+          fi
+
+      - name: Resolve environment row
+        id: env
+        env:
+          ENV: ${{ inputs.environment }}
+        run: |
+          # Same rows as deploy.yml's "Set environment variables" step.
+          case "$ENV" in
+            staging)
+              RELAY_EDGE=load-balancer
+              RELAY_INGRESS=internal-and-cloud-load-balancing
+              RELAY_EXTERNAL_URL=https://stg-relay.zkproofport.app
+              PLAY_INTEGRITY=on
+              MAX_INSTANCES=5
+              ;;
+            production)
+              echo "production is not enabled in this fallback workflow." >&2
+              exit 1
+              ;;
+            *)
+              echo "Unknown environment '$ENV'. Known: staging, production (refused)." >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "ENV=$ENV"
+            echo "RELAY_EDGE=$RELAY_EDGE"
+            echo "RELAY_INGRESS=$RELAY_INGRESS"
+            echo "RELAY_EXTERNAL_URL=$RELAY_EXTERNAL_URL"
+            echo "PLAY_INTEGRITY=$PLAY_INTEGRITY"
+            echo "MAX_INSTANCES=$MAX_INSTANCES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record source commit
+        id: src
+        run: echo "SHA=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Refuse to roll back the running relay
+        env:
+          SERVICE: proofport-relay-${{ steps.env.outputs.ENV }}
+          REGION: ${{ secrets.GCP_REGION }}
+          DEPLOYED_RELAY_SHA: ${{ inputs.deployed_relay_sha }}
+          SHA: ${{ steps.src.outputs.SHA }}
+        run: |
+          IMAGE=$(gcloud run services describe "$SERVICE" --region "$REGION" \
+            --format='value(spec.template.spec.containers[0].image)')
+          TAG_SHA=$(printf '%s' "$IMAGE" | sed -n 's/.*:[a-z]*-\([0-9a-f]\{40\}\)$/\1/p')
+          if [ -z "$TAG_SHA" ]; then
+            echo "Running image tag carries no commit; cannot check ancestry." >&2
+            exit 1
+          fi
+          if git cat-file -e "${TAG_SHA}^{commit}" 2>/dev/null; then
+            RUNNING="$TAG_SHA"
+            echo "Running image was built by this workflow from $RUNNING"
+          elif [ -n "$DEPLOYED_RELAY_SHA" ]; then
+            RUNNING="$DEPLOYED_RELAY_SHA"
+            echo "Running image was built by the monorepo ($TAG_SHA); relay commit given as $RUNNING"
+          else
+            echo "Running image tag $TAG_SHA is not a commit of this repository (a monorepo build)." >&2
+            echo "Pass deployed_relay_sha = git ls-tree $TAG_SHA proofport-relay." >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$RUNNING" "$SHA"; then
+            echo "Running relay $RUNNING is not an ancestor of $SHA; deploying would drop it." >&2
+            exit 1
+          fi
+          echo "OK: $RUNNING is contained in $SHA"
+
+      - name: Configure Docker for Artifact Registry
+        env:
+          REGION: ${{ secrets.GCP_REGION }}
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Relay image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.prod
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ secrets.GCP_ARTIFACT_REGISTRY }}/proofport-relay:${{ steps.env.outputs.ENV }}-${{ steps.src.outputs.SHA }}
+            ${{ secrets.GCP_ARTIFACT_REGISTRY }}/proofport-relay:${{ steps.env.outputs.ENV }}-latest
+          labels: |
+            org.opencontainers.image.revision=${{ steps.src.outputs.SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy Relay to Cloud Run
+        env:
+          SERVICE: proofport-relay-${{ steps.env.outputs.ENV }}
+          REGION: ${{ secrets.GCP_REGION }}
+          IMAGE: ${{ secrets.GCP_ARTIFACT_REGISTRY }}/proofport-relay:${{ steps.env.outputs.ENV }}-${{ steps.src.outputs.SHA }}
+          VPC_CONNECTOR: ${{ secrets.GCP_VPC_CONNECTOR }}
+          ENV: ${{ steps.env.outputs.ENV }}
+          STAGING_REDIS_URL: ${{ secrets.STAGING_REDIS_URL }}
+          RELAY_EXTERNAL_URL: ${{ steps.env.outputs.RELAY_EXTERNAL_URL }}
+          RELAY_EDGE: ${{ steps.env.outputs.RELAY_EDGE }}
+          RELAY_INGRESS: ${{ steps.env.outputs.RELAY_INGRESS }}
+          PLAY_INTEGRITY: ${{ steps.env.outputs.PLAY_INTEGRITY }}
+          MAX_INSTANCES: ${{ steps.env.outputs.MAX_INSTANCES }}
+        run: |
+          case "$ENV" in
+            staging) REDIS_URL="$STAGING_REDIS_URL" ;;
+            *) echo "No REDIS_URL row for environment '$ENV'" >&2; exit 1 ;;
+          esac
+          if [ -z "$REDIS_URL" ]; then echo "REDIS_URL secret for '$ENV' is empty" >&2; exit 1; fi
+          SECRETS="RELAY_STATS_TOKEN=relay-stats-token-${ENV}:latest"
+          case "$PLAY_INTEGRITY" in
+            on)  SECRETS="${SECRETS},PLAY_INTEGRITY_DECRYPTION_KEY=play-integrity-decryption-key:latest,PLAY_INTEGRITY_VERIFICATION_KEY=play-integrity-verification-key:latest" ;;
+            off) echo "::warning::PLAY_INTEGRITY is off for ${ENV}; POST /api/v1/play-integrity/decrypt will answer 503" ;;
+            *)   echo "Unknown PLAY_INTEGRITY '$PLAY_INTEGRITY' for ${ENV}. Known: on, off." >&2; exit 1 ;;
+          esac
+          gcloud run deploy "$SERVICE" \
+            --region "$REGION" \
+            --image "$IMAGE" \
+            --platform managed \
+            --port 4001 \
+            --cpu 1 \
+            --memory 512Mi \
+            --min-instances 1 \
+            --max-instances "$MAX_INSTANCES" \
+            --allow-unauthenticated \
+            --set-env-vars "^;;^NODE_ENV=production;;REDIS_URL=${REDIS_URL};;RELAY_EXTERNAL_URL=${RELAY_EXTERNAL_URL};;RELAY_EDGE=${RELAY_EDGE}" \
+            --ingress "$RELAY_INGRESS" \
+            --set-secrets "${SECRETS}" \
+            --session-affinity \
+            --vpc-connector "$VPC_CONNECTOR" \
+            --vpc-egress private-ranges-only \
+            --quiet
+
+      - name: Verify revision and health
+        env:
+          SERVICE: proofport-relay-${{ steps.env.outputs.ENV }}
+          REGION: ${{ secrets.GCP_REGION }}
+          SHA: ${{ steps.src.outputs.SHA }}
+          ENV: ${{ steps.env.outputs.ENV }}
+          RELAY_EXTERNAL_URL: ${{ steps.env.outputs.RELAY_EXTERNAL_URL }}
+        run: |
+          REVISION=$(gcloud run services describe "$SERVICE" --region "$REGION" \
+            --format='value(status.latestReadyRevisionName)')
+          TRAFFIC=$(gcloud run services describe "$SERVICE" --region "$REGION" \
+            --format='value(status.traffic[0].revisionName,status.traffic[0].percent)')
+          IMAGE=$(gcloud run revisions describe "$REVISION" --region "$REGION" \
+            --format='value(spec.containers[0].image)')
+          echo "Revision: $REVISION"
+          echo "Traffic:  $TRAFFIC"
+          case "$IMAGE" in
+            *":${ENV}-${SHA}") echo "Image tag carries $SHA" ;;
+            *) echo "Revision $REVISION runs an image whose tag is not ${ENV}-${SHA}" >&2; exit 1 ;;
+          esac
+          for i in $(seq 1 10); do
+            BODY=$(curl -fsS -m 10 "${RELAY_EXTERNAL_URL}/health" || true)
+            if printf '%s' "$BODY" | grep -q '"status":"ok"'; then
+              echo "Health: $BODY"
+              break
+            fi
+            if [ "$i" = 10 ]; then
+              echo "${RELAY_EXTERNAL_URL}/health did not answer ok: $BODY" >&2
+              exit 1
+            fi
+            sleep 6
+          done
+          {
+            echo "### Relay deployed (emergency workflow)"
+            echo ""
+            echo "- Environment: \`${ENV}\`"
+            echo "- Relay commit: \`${SHA}\`"
+            echo "- Revision: \`${REVISION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
