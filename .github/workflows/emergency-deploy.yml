@@ -9,10 +9,11 @@
 # as soon as it runs again. Its next run must use a relay commit that contains
 # whatever this workflow deployed, or it rolls the relay back.
 #
-# Environments: `staging` only. The `production` row exists so the table has the
-# same shape as `deploy.yml`, and is refused until someone deliberately enables
-# it here (and widens the workload identity provider, which is restricted to
-# this file on `main` triggered by workflow_dispatch).
+# Environments: `staging` and `production` (production enabled 2026-10-29 by
+# the user's decision to ship the relay during app store review while the
+# monorepo cannot run Actions). Both rows mirror deploy.yml's. The workload
+# identity provider accepts only this file on `main` triggered by
+# workflow_dispatch, whichever environment is chosen.
 #
 # KEEP IN SYNC with the monorepo's deploy.yml (relay parts). Anything that
 # differs makes switching back change the running service:
@@ -33,7 +34,8 @@
 # Repository secrets (Settings > Secrets and variables > Actions):
 #   GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT, GCP_REGION,
 #   GCP_ARTIFACT_REGISTRY, GCP_VPC_CONNECTOR, GCP_PROJECT, GCP_PROJECT_NUMBER,
-#   STAGING_REDIS_URL
+#   STAGING_REDIS_URL, PRODUCTION_REDIS_URL (each copied from the running
+#   revision of proofport-relay-<env>; the monorepo's own copies cannot be read)
 # They are secrets (not variables) so this public repository's run logs mask
 # them.
 
@@ -43,11 +45,12 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Environment (staging only; production is refused)'
+        description: 'Environment'
         required: true
         type: choice
         options:
           - staging
+          - production
       deployed_relay_sha:
         description: >-
           Relay commit currently running, when the running image was built by
@@ -106,11 +109,14 @@ jobs:
               MAX_INSTANCES=5
               ;;
             production)
-              echo "production is not enabled in this fallback workflow." >&2
-              exit 1
+              RELAY_EDGE=load-balancer
+              RELAY_INGRESS=internal-and-cloud-load-balancing
+              RELAY_EXTERNAL_URL=https://relay.zkproofport.app
+              PLAY_INTEGRITY=on
+              MAX_INSTANCES=20
               ;;
             *)
-              echo "Unknown environment '$ENV'. Known: staging, production (refused)." >&2
+              echo "Unknown environment '$ENV'. Known: staging, production." >&2
               exit 1
               ;;
           esac
@@ -203,6 +209,7 @@ jobs:
           VPC_CONNECTOR: ${{ secrets.GCP_VPC_CONNECTOR }}
           ENV: ${{ steps.env.outputs.ENV }}
           STAGING_REDIS_URL: ${{ secrets.STAGING_REDIS_URL }}
+          PRODUCTION_REDIS_URL: ${{ secrets.PRODUCTION_REDIS_URL }}
           RELAY_EXTERNAL_URL: ${{ steps.env.outputs.RELAY_EXTERNAL_URL }}
           RELAY_EDGE: ${{ steps.env.outputs.RELAY_EDGE }}
           RELAY_INGRESS: ${{ steps.env.outputs.RELAY_INGRESS }}
@@ -211,6 +218,7 @@ jobs:
         run: |
           case "$ENV" in
             staging) REDIS_URL="$STAGING_REDIS_URL" ;;
+            production) REDIS_URL="$PRODUCTION_REDIS_URL" ;;
             *) echo "No REDIS_URL row for environment '$ENV'" >&2; exit 1 ;;
           esac
           if [ -z "$REDIS_URL" ]; then echo "REDIS_URL secret for '$ENV' is empty" >&2; exit 1; fi
