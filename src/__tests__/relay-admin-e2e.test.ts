@@ -74,7 +74,7 @@ describe('stats by site, scope and country on the container', () => {
     const created = await fetch(`${A}/api/v1/proof/request`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': ip, Origin: origin },
-      body: JSON.stringify({ requestId: ch.requestId, challenge: ch.challenge, circuitId: 'mdl_kr_age', inputs: {}, scope }),
+      body: JSON.stringify({ requestId: ch.requestId, challenge: ch.challenge, circuitId: 'oidc_domain_attestation', inputs: {}, scope }),
     });
     expect(created.status).toBe(201);
     // CORS answers the dApp's own origin as allowed (any origin may call).
@@ -82,7 +82,7 @@ describe('stats by site, scope and country on the container', () => {
     const answered = await fetch(`${A}/api/v1/proof/callback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Relay-Client-Region': 'JP' },
-      body: JSON.stringify({ requestId: ch.requestId, status: 'completed', circuit: 'mdl_kr_age', proof: '0x01', publicInputs: [] }),
+      body: JSON.stringify({ requestId: ch.requestId, status: 'completed', circuit: 'oidc_domain_attestation', proof: '0x01', publicInputs: [] }),
     });
     expect(answered.status).toBe(200);
 

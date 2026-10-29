@@ -15,6 +15,7 @@ import { createRelay, ERROR_MESSAGE_MAX_CHARS, EXPIRED_MESSAGE, Relay } from '..
 import { EDGES } from '../edge';
 import { createStatsRecorder, DIMENSION_MAX_VALUES_PER_DAY, readStats, StatsRecorder, utcDay } from '../stats';
 import { DEADLINES_KEY, metaKey, TERMINAL_TTL_SECONDS } from '../lifecycle';
+import { ALL_CIRCUIT_IDS } from '@zkproofport-app/core/circuits';
 
 /** The relay's public origin in tests; every deep link's callbackUrl must be built from it. */
 const TEST_EXTERNAL_URL = 'https://relay.example.test';
@@ -194,13 +195,13 @@ describe('terminal outcomes', () => {
   it('an answer naming another circuit is refused for every status: not delivered, not counted, request stays open', async () => {
     const { url } = await start();
     const before = await todayCounts('coinbase_attestation');
-    const beforeOther = await todayCounts('mdl_kr_age');
+    const beforeOther = await todayCounts('oidc_domain_attestation');
     const { requestId } = await createRequest(url);
     const dapp = await dappSocket(url, requestId);
 
     for (const body of [
-      { status: 'completed', circuit: 'mdl_kr_age', ...PROOF },
-      { status: 'error', circuit: 'mdl_kr_age', errorCode: 'E2007' },
+      { status: 'completed', circuit: 'oidc_domain_attestation', ...PROOF },
+      { status: 'error', circuit: 'oidc_domain_attestation', errorCode: 'E2007' },
       { status: 'cancelled', circuit: 'coinbase-kyc' },
       { status: 'generating', circuit: 'COINBASE_ATTESTATION' },
       { status: 'completed', circuit: 'coinbase_attestation ', ...PROOF },
@@ -214,7 +215,7 @@ describe('terminal outcomes', () => {
     expect(dapp.results).toHaveLength(0);
     expect((await poll(url, requestId)).body.status).toBe('pending');
     expect((await todayCounts('coinbase_attestation')).completed).toBe(before.completed);
-    expect((await todayCounts('mdl_kr_age')).completed).toBe(beforeOther.completed);
+    expect((await todayCounts('oidc_domain_attestation')).completed).toBe(beforeOther.completed);
 
     // The real answer still lands afterwards.
     expect((await callback(url, { requestId, status: 'completed', circuit: 'coinbase_attestation', ...PROOF })).status).toBe(200);
@@ -347,6 +348,34 @@ describe('idempotency', () => {
     expect((await callback(url, { requestId, status: 'generating' })).status).toBe(409);
     expect((await poll(url, requestId)).body.status).toBe('completed');
   });
+});
+
+describe('request validation', () => {
+  // The Korean mobile ID circuits left core in 0.4.0 (moved to a separate
+  // product). A request naming one is an unknown circuit like any other: no
+  // signature policy, no forwarding, nothing counted.
+  it.each(['mdl_kr_age', 'mdl_kr_ownership', 'mdl_kr_region', 'COINBASE_ATTESTATION', 'coinbase-kyc'])(
+    'refuses circuit %s as unknown, names the known ids, and leaves the session usable',
+    async (circuitId) => {
+      const { url } = await start();
+      const ch = await (await fetch(`${url}/api/v1/challenge`)).json() as { requestId: string; challenge: string };
+      const signature = await wallet.signMessage(ch.challenge);
+      const send = (id: string) => fetch(`${url}/api/v1/proof/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestId: ch.requestId, challenge: ch.challenge, signature, circuitId: id, inputs: { scope: 'myapp.com' } }),
+      });
+      const refused = await send(circuitId);
+      expect(refused.status).toBe(400);
+      const error = String(((await refused.json()) as { error: unknown }).error);
+      expect(error).toContain(`unknown circuit '${circuitId}'`);
+      expect(error).toContain(`Known: ${ALL_CIRCUIT_IDS.join(', ')}`);
+      expect(ALL_CIRCUIT_IDS).not.toContain(circuitId);
+      expect(await todayCounts(circuitId)).toMatchObject({ requested: 0 });
+      // The refusal ran before the session was claimed.
+      expect((await send('coinbase_attestation')).status).toBe(201);
+    },
+  );
 });
 
 describe('callback validation', () => {

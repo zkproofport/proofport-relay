@@ -22,14 +22,10 @@ export const SIGNATURE_POLICY = {
   coinbase_country_attestation: true,
   // The signature is inside the OIDC identity token, checked by the prover.
   oidc_domain_attestation: false,
-  // Web2 (OmniOne CX) flows with no wallet binding at all.
-  mdl_kr_ownership: false,
-  mdl_kr_age: false,
-  mdl_kr_region: false,
   // A GIWA-attested wallet signs, exactly like Coinbase: the circuit has
-  // verified a secp256k1 signature since the day it was forked. This said
-  // `false` because it sat under the Web2 comment above and nobody revisited
-  // it, so a GIWA request reached the relay with no signature required.
+  // verified a secp256k1 signature since the day it was forked. This once said
+  // `false` because it sat under a comment about wallet-less flows and nobody
+  // revisited it, so a GIWA request reached the relay with no signature required.
   giwa_attestation: true,
   // The wallet signs the request, and the circuit checks that the same key
   // signed its Playground faucet transaction.

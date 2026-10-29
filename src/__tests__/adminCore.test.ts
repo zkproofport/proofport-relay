@@ -65,17 +65,17 @@ function labelRow(value: string | null, marker: string | null, circuits: Record<
   return { value, marker, circuits: out, all } as never;
 }
 function withLabels(): StatsReport {
-  const r = report([{ date: '2026-10-14', circuits: { mdl_kr_age: counts({ requested: 9, completed: 6 }), coinbase_attestation: counts({ requested: 3 }) } }]);
+  const r = report([{ date: '2026-10-14', circuits: { oidc_domain_attestation: counts({ requested: 9, completed: 6 }), coinbase_attestation: counts({ requested: 3 }) } }]);
   r.dimensions.origin = {
-    'v:dojangscan.com': labelRow('dojangscan.com', null, { mdl_kr_age: { requested: 6, completed: 4, cancelled: 1 } }),
-    'v:demo.zkproofport.app': labelRow('demo.zkproofport.app', null, { mdl_kr_age: { requested: 3, completed: 2 }, coinbase_attestation: { requested: 3 } }),
+    'v:dojangscan.com': labelRow('dojangscan.com', null, { oidc_domain_attestation: { requested: 6, completed: 4, cancelled: 1 } }),
+    'v:demo.zkproofport.app': labelRow('demo.zkproofport.app', null, { oidc_domain_attestation: { requested: 3, completed: 2 }, coinbase_attestation: { requested: 3 } }),
     'm:none': labelRow(null, 'none', {}),
   };
-  r.dimensions.scope = { 'm:other': labelRow(null, 'other', { mdl_kr_age: { requested: 1 } }) };
+  r.dimensions.scope = { 'm:other': labelRow(null, 'other', { oidc_domain_attestation: { requested: 1 } }) };
   r.dimensions.country = {
-    'v:KR': labelRow('KR', null, { mdl_kr_age: { completed: 5, error: 1 } }),
-    'v:US': labelRow('US', null, { mdl_kr_age: { completed: 1 }, coinbase_attestation: { cancelled: 1 } }),
-    'm:unknown': labelRow(null, 'unknown', { mdl_kr_age: { error: 2 } }),
+    'v:KR': labelRow('KR', null, { oidc_domain_attestation: { completed: 5, error: 1 } }),
+    'v:US': labelRow('US', null, { oidc_domain_attestation: { completed: 1 }, coinbase_attestation: { cancelled: 1 } }),
+    'm:unknown': labelRow(null, 'unknown', { oidc_domain_attestation: { error: 2 } }),
   };
   return r;
 }
@@ -96,7 +96,7 @@ describe('labels (site, scope, country)', () => {
   it('a label filter: per-circuit rows and totals of that label only', () => {
     const r = withLabels();
     expect(core.labelCircuitRows(r, 'origin', 'v:demo.zkproofport.app').map((x) => [x.circuit, x.requested])).toEqual([
-      ['coinbase_attestation', 3], ['mdl_kr_age', 3],
+      ['coinbase_attestation', 3], ['oidc_domain_attestation', 3],
     ]);
     expect(core.labelTotals(r, 'origin', 'v:dojangscan.com')).toMatchObject({ requested: 6, completed: 4, rate: '66.7%' });
     expect(core.labelTotals(r, 'origin', 'v:dojangscan.com', 'coinbase_attestation')).toMatchObject({ requested: 0, rate: '—' });
@@ -116,7 +116,7 @@ describe('labels (site, scope, country)', () => {
 
   it('a label is text only: markup in a value comes back as the same characters', () => {
     const r = withLabels();
-    r.dimensions.scope['v:%3Cimg%3E'] = labelRow('<img src=x onerror=alert(1)>', null, { mdl_kr_age: { requested: 1 } });
+    r.dimensions.scope['v:%3Cimg%3E'] = labelRow('<img src=x onerror=alert(1)>', null, { oidc_domain_attestation: { requested: 1 } });
     expect(core.dimensionRows(r, 'scope').map((x) => x.label)).toContain('<img src=x onerror=alert(1)>');
   });
 });
@@ -149,7 +149,7 @@ describe('country map', () => {
     expect(d.code).toBe('US');
     expect(d.name).toContain('US');
     expect(d.total).toEqual({ completed: 1, error: 0, cancelled: 1, answered: 2 });
-    expect(d.circuits.map((c) => c.circuit)).toEqual(['coinbase_attestation', 'mdl_kr_age']);
+    expect(d.circuits.map((c) => c.circuit)).toEqual(['coinbase_attestation', 'oidc_domain_attestation']);
   });
 
   it('a country with no answers opens empty rather than failing', () => {
@@ -255,14 +255,14 @@ describe('tokenFormatError', () => {
 
 describe('table rows', () => {
   const r = report([
-    { date: '2026-10-13', circuits: { coinbase_attestation: counts({ requested: 4, completed: 2, byCode: { E2005: 1 } }), mdl_kr_ownership: counts({ requested: 1, expired: 1 }) } },
+    { date: '2026-10-13', circuits: { coinbase_attestation: counts({ requested: 4, completed: 2, byCode: { E2005: 1 } }), dojang_playground: counts({ requested: 1, expired: 1 }) } },
     { date: '2026-10-14', circuits: { coinbase_attestation: counts({ requested: 2, cancelled: 1, byCode: { E2005: 1, none: 1 } }) } },
   ]);
 
   it('circuit rows are busiest first, with success rate', () => {
     expect(core.circuitRows(r)).toEqual([
       { circuit: 'coinbase_attestation', requested: 6, completed: 2, error: 3, cancelled: 1, expired: 0, rate: '33.3%' },
-      { circuit: 'mdl_kr_ownership', requested: 1, completed: 0, error: 0, cancelled: 0, expired: 1, rate: '0.0%' },
+      { circuit: 'dojang_playground', requested: 1, completed: 0, error: 0, cancelled: 0, expired: 1, rate: '0.0%' },
     ]);
     expect(core.totalsRow(r)).toEqual({ requested: 7, completed: 2, error: 3, cancelled: 1, expired: 1, rate: '28.6%' });
   });
@@ -272,7 +272,7 @@ describe('table rows', () => {
       { circuit: 'coinbase_attestation', code: 'E2005', label: 'Attestation Not Found', count: 2 },
       { circuit: 'coinbase_attestation', code: 'none', label: '코드 없음', count: 1 },
     ]);
-    expect(core.errorRows(r, 'mdl_kr_ownership')).toEqual([]);
+    expect(core.errorRows(r, 'dojang_playground')).toEqual([]);
   });
 
   it('daily rows keep every day of the range and sum or filter circuits', () => {
@@ -280,7 +280,7 @@ describe('table rows', () => {
       { date: '2026-10-13', requested: 5, completed: 2, error: 1, cancelled: 0, expired: 1 },
       { date: '2026-10-14', requested: 2, completed: 0, error: 2, cancelled: 1, expired: 0 },
     ]);
-    expect(core.dailyRows(r, 'mdl_kr_ownership').map((d) => d.requested)).toEqual([1, 0]);
+    expect(core.dailyRows(r, 'dojang_playground').map((d) => d.requested)).toEqual([1, 0]);
   });
 
   it('a circuit name that is markup is carried as data, unchanged (the DOM side uses textContent)', () => {

@@ -103,7 +103,7 @@ describe('session and nonce claim across the two containers', () => {
 describe('callback contract on the containers', () => {
   it('an answer naming another circuit is refused; the right one is then delivered under the requested circuit', async () => {
     const { requestId } = await createRequest(B);
-    const wrong = await callback(A, { requestId, status: 'completed', circuit: 'mdl_kr_age', ...PROOF });
+    const wrong = await callback(A, { requestId, status: 'completed', circuit: 'oidc_domain_attestation', ...PROOF });
     expect(wrong.status).toBe(400);
     expect((await poll(B, requestId)).status).toBe('pending');
     expect((await callback(B, { requestId, status: 'completed', circuit: 'coinbase_attestation', ...PROOF })).status).toBe(200);

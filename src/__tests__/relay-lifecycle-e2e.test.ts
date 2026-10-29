@@ -29,7 +29,7 @@ const A = required('RELAY_URL');
 const B = required('RELAY_B_URL');
 const TOKEN = required('RELAY_STATS_TOKEN');
 const REDIS_E2E_URL = required('REDIS_E2E_URL');
-const CIRCUIT = 'mdl_kr_ownership';
+const CIRCUIT = 'oidc_domain_attestation';
 /** What every `completed` answer must carry since 2026-10-27. */
 const PROOF = { proof: '0xdead', publicInputs: ['0x01'] };
 
@@ -121,7 +121,11 @@ async function backdate(requestId: string) {
   const raw = await redis.get(`proof:meta:${requestId}`);
   if (!raw) throw new Error(`no proof:meta for ${requestId} -- is the container running this relay version?`);
   const meta = JSON.parse(raw);
-  meta.deadlineAt = Date.now() - 1;
+  // A minute back, not one millisecond: this is the HOST's clock and the
+  // containers read the VM's. Measured 2026-10-29, the VM ran ~5 ms behind the
+  // host, so `Date.now() - 1` was still in the container's future when the
+  // poll arrived a few ms later and lazy expiry correctly answered `pending`.
+  meta.deadlineAt = Date.now() - 60_000;
   await redis.set(`proof:meta:${requestId}`, JSON.stringify(meta), 'KEEPTTL');
   await redis.zadd('proof:deadlines', meta.deadlineAt, requestId);
 }

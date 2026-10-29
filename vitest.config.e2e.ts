@@ -15,7 +15,7 @@ export default defineConfig({
     testTimeout: 30_000,
     // One file at a time. Every file talks to the same relay and Redis, and
     // the per-day statistics are global: relay-lifecycle-e2e asserts that one
-    // request moved `mdl_kr_ownership`'s count by exactly 1, while
+    // request moved `oidc_domain_attestation`'s count by exactly 1, while
     // admin-browser-e2e creates three requests for the same circuit on the
     // same day. Run in parallel, the delta read 4 (2026-10-23).
     fileParallelism: false,

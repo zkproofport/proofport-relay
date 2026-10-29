@@ -22,12 +22,12 @@ describe('statsField', () => {
     expect(statsField('coinbase_attestation', 'expired')).toBe('coinbase_attestation|expired');
   });
   it('buckets an error by code, and an absent code as none', () => {
-    expect(statsField('mdl_kr_age', 'error', 'E2007')).toBe('mdl_kr_age|error|E2007');
-    expect(statsField('mdl_kr_age', 'error')).toBe('mdl_kr_age|error|none');
+    expect(statsField('oidc_domain_attestation', 'error', 'E2007')).toBe('oidc_domain_attestation|error|E2007');
+    expect(statsField('oidc_domain_attestation', 'error')).toBe('oidc_domain_attestation|error|none');
   });
   it('refuses a malformed code rather than writing it as a field', () => {
-    expect(() => statsField('mdl_kr_age', 'error', 'E20')).toThrow(/errorCode/);
-    expect(() => statsField('mdl_kr_age', 'error', 'x|y')).toThrow(/errorCode/);
+    expect(() => statsField('oidc_domain_attestation', 'error', 'E20')).toThrow(/errorCode/);
+    expect(() => statsField('oidc_domain_attestation', 'error', 'x|y')).toThrow(/errorCode/);
   });
 });
 
@@ -107,21 +107,21 @@ describe('createStatsRecorder', () => {
 
   it('with labels, adds one capped script call per label in the same MULTI, on the same day', () => {
     const { client, calls } = fakeRedis(() => Promise.resolve([]));
-    createStatsRecorder(client).record('mdl_kr_age', 'completed', undefined, new Date('2026-10-14T23:59:59.999Z'), {
+    createStatsRecorder(client).record('oidc_domain_attestation', 'completed', undefined, new Date('2026-10-14T23:59:59.999Z'), {
       origin: 'v:dojangscan.com', scope: 'm:none', country: 'v:KR',
     });
     expect(calls.slice(0, 2).map((c) => c[0])).toEqual(['hincrby', 'expire']);
     expect(calls.slice(2)).toEqual(
       (['origin', 'scope', 'country'] as const).map((kind, i) => [
         'eval', DIMENSION_LUA, 2, `relay:stats:dim:${kind}:2026-10-14`, `relay:stats:dim-seen:${kind}:2026-10-14`,
-        ['v:dojangscan.com', 'm:none', 'v:KR'][i], 'mdl_kr_age|completed', DIMENSION_MAX_VALUES_PER_DAY, STATS_TTL_SECONDS, 'm:other',
+        ['v:dojangscan.com', 'm:none', 'v:KR'][i], 'oidc_domain_attestation|completed', DIMENSION_MAX_VALUES_PER_DAY, STATS_TTL_SECONDS, 'm:other',
       ]),
     );
   });
 
   it('a label kind that was not given is not written at all (expiry has no country)', () => {
     const { client, calls } = fakeRedis(() => Promise.resolve([]));
-    createStatsRecorder(client).record('mdl_kr_age', 'expired', undefined, undefined, { origin: 'v:a.com', scope: 'v:s' });
+    createStatsRecorder(client).record('oidc_domain_attestation', 'expired', undefined, undefined, { origin: 'v:a.com', scope: 'v:s' });
     expect(calls.filter((c) => c[0] === 'eval').map((c) => c[3])).toEqual([
       expect.stringContaining('dim:origin:'), expect.stringContaining('dim:scope:'),
     ]);
@@ -129,8 +129,8 @@ describe('createStatsRecorder', () => {
 
   it('an error outcome is counted by label as "error", without its code', () => {
     const { client, calls } = fakeRedis(() => Promise.resolve([]));
-    createStatsRecorder(client).record('mdl_kr_age', 'error', 'E2007', undefined, { origin: 'v:a.com' });
-    expect(calls.find((c) => c[0] === 'eval')![6]).toBe('mdl_kr_age|error');
+    createStatsRecorder(client).record('oidc_domain_attestation', 'error', 'E2007', undefined, { origin: 'v:a.com' });
+    expect(calls.find((c) => c[0] === 'eval')![6]).toBe('oidc_domain_attestation|error');
   });
 
   it('lands an event one millisecond later on the next day', () => {
@@ -202,8 +202,8 @@ describe('readStats', () => {
       },
       'relay:stats:2026-10-15': {
         'coinbase_attestation|expired': '1',
-        'mdl_kr_age|requested': '1',
-        'mdl_kr_age|error|none': '1',
+        'oidc_domain_attestation|requested': '1',
+        'oidc_domain_attestation|error|none': '1',
       },
     });
     const report = await readStats(redis, ['2026-10-14', '2026-10-15']);
@@ -223,15 +223,15 @@ describe('readStats', () => {
 
   it('sums label hashes over the range per label and circuit, abandoned = cancelled + expired', async () => {
     const redis = pipelineOf({
-      'relay:stats:dim:origin:2026-10-14': { 'v:dojangscan.com|mdl_kr_age|requested': '2', 'v:dojangscan.com|mdl_kr_age|cancelled': '1', 'm:none|coinbase_attestation|requested': '1' },
-      'relay:stats:dim:origin:2026-10-15': { 'v:dojangscan.com|mdl_kr_age|requested': '1', 'v:dojangscan.com|mdl_kr_age|expired': '1' },
-      'relay:stats:dim:country:2026-10-15': { 'v:KR|mdl_kr_age|completed': '3', 'm:unknown|mdl_kr_age|error': '1' },
-      'relay:stats:dim:scope:2026-10-14': { 'v:a%7Cb|mdl_kr_age|requested': '1' },
+      'relay:stats:dim:origin:2026-10-14': { 'v:dojangscan.com|oidc_domain_attestation|requested': '2', 'v:dojangscan.com|oidc_domain_attestation|cancelled': '1', 'm:none|coinbase_attestation|requested': '1' },
+      'relay:stats:dim:origin:2026-10-15': { 'v:dojangscan.com|oidc_domain_attestation|requested': '1', 'v:dojangscan.com|oidc_domain_attestation|expired': '1' },
+      'relay:stats:dim:country:2026-10-15': { 'v:KR|oidc_domain_attestation|completed': '3', 'm:unknown|oidc_domain_attestation|error': '1' },
+      'relay:stats:dim:scope:2026-10-14': { 'v:a%7Cb|oidc_domain_attestation|requested': '1' },
     });
     const report = await readStats(redis, ['2026-10-14', '2026-10-15']);
     expect(report.dimensions.origin['v:dojangscan.com']).toEqual({
       value: 'dojangscan.com', marker: null,
-      circuits: { mdl_kr_age: { requested: 3, completed: 0, error: 0, cancelled: 1, expired: 1, abandoned: 2 } },
+      circuits: { oidc_domain_attestation: { requested: 3, completed: 0, error: 0, cancelled: 1, expired: 1, abandoned: 2 } },
       all: { requested: 3, completed: 0, error: 0, cancelled: 1, expired: 1, abandoned: 2 },
     });
     expect(report.dimensions.origin['m:none']).toMatchObject({ value: null, marker: 'none' });
