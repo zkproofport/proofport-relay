@@ -26,15 +26,26 @@ import { decryptPlayIntegrityToken, PlayIntegrityConfig, PlayIntegrityError, Pla
 /**
  * How long the relay waits for the app before it answers the dApp itself.
  *
- * The SDK's `waitForProof()` / `waitForResult()` give up after 300 000 ms by
+ * The SDK's `waitForProof()` / `waitForResult()` give up after 600 000 ms by
  * default. The relay's own answer has to reach the dApp BEFORE that, or the
  * dApp sees its own "timed out" error instead of a result it can branch on.
- * 280 s leaves 20 s for the sweep interval (5 s), the cross-instance publish
- * and the client's own poll interval (2 s), with margin. A user generating a
- * proof on a phone finishes well inside this; a request still open at 280 s
- * has been abandoned.
+ * 540 s leaves 60 s for the sweep interval (5 s), the cross-instance publish
+ * and the client's own poll interval (2 s), with margin.
+ *
+ * It must also end before Redis forgets the request: the status, meta and
+ * inputs-hash keys are written once at creation with STATUS_TTL_SECONDS
+ * (600 s), and the sweep needs the status to write `expired` and the meta to
+ * name the circuit. The latest an expiry can run is deadline + one sweep
+ * interval = 545 s, 55 s inside that TTL. The terminal answer then gets a
+ * fresh status TTL and its own RESULT_TTL_SECONDS, counted from the moment it
+ * is written, so a dApp polling after the deadline still reads it.
+ *
+ * A heavy proof on an older Android phone takes about 2.5 min of proving after
+ * the user has opened the request, read it and confirmed; 280 s (the old
+ * value) left too little room for that. A request still open at 540 s has
+ * been abandoned. `deadlineFitsTheTtls.test.ts` holds these relationships.
  */
-export const REQUEST_DEADLINE_MS = 280_000;
+export const REQUEST_DEADLINE_MS = 540_000;
 
 /** How often each instance looks for requests past their deadline. */
 export const SWEEP_INTERVAL_MS = 5_000;

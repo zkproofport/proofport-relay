@@ -152,7 +152,7 @@ async function todayCounts(circuit: string) {
   return report.days[0].circuits[circuit] ?? { requested: 0, completed: 0, cancelled: 0, expired: 0, abandoned: 0, error: { total: 0, byCode: {} } };
 }
 
-/** Pushes a request's deadline into the past, as if 280 s had gone by. */
+/** Pushes a request's deadline into the past, as if 540 s had gone by. */
 async function backdate(requestId: string) {
   const meta = JSON.parse((await redis.get(metaKey(requestId)))!);
   meta.deadlineAt = Date.now() - 1;

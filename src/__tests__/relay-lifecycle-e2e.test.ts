@@ -6,7 +6,7 @@
  *
  * Real HTTP and real Socket.IO to running containers; nothing mocked. The only
  * shortcut is that the expiry tests move a request's deadline into the past in
- * Redis instead of waiting the real 280 s.
+ * Redis instead of waiting the real 540 s.
  *
  * Run: `scripts/test-relay.sh e2e` -- it starts relay-b, passes the env below
  * and removes relay-b afterwards.
@@ -116,7 +116,7 @@ async function stats(url = A) {
   return body.days[0].circuits[CIRCUIT] ?? { requested: 0, completed: 0, cancelled: 0, expired: 0, error: { byCode: {} } };
 }
 
-/** Moves a request's deadline into the past, standing in for 280 s of waiting. */
+/** Moves a request's deadline into the past, standing in for 540 s of waiting. */
 async function backdate(requestId: string) {
   const raw = await redis.get(`proof:meta:${requestId}`);
   if (!raw) throw new Error(`no proof:meta for ${requestId} -- is the container running this relay version?`);

@@ -364,7 +364,7 @@ Each is `{ "<label>": { value, marker, circuits: { <circuit>: {requested, comple
 
 #### Request deadline
 
-The relay answers the dApp itself when the app has not answered within **280 s** (`REQUEST_DEADLINE_MS` in `src/app.ts`), 20 s before the SDK's default 300 s wait gives up. The result is `{ "status": "expired", "error": "The request timed out before the app answered" }`, delivered over `proof:result` and polling like any other terminal status, and counted as `expired`. A late app callback gets 409 `{ "error": "The request timed out before the app answered", "reason": "expired" }`.
+The relay answers the dApp itself when the app has not answered within **540 s** (`REQUEST_DEADLINE_MS` in `src/app.ts`), 60 s before the SDK's default 600 s wait gives up. The result is `{ "status": "expired", "error": "The request timed out before the app answered" }`, delivered over `proof:result` and polling like any other terminal status, and counted as `expired`. A late app callback gets 409 `{ "error": "The request timed out before the app answered", "reason": "expired" }`.
 
 Deadlines live in the Redis sorted set `proof:deadlines`, not in process memory: every instance sweeps it every 5 s, the atomic terminal script lets exactly one instance win each expiry, and a poll, subscribe or callback that touches an overdue request expires it on the spot.
 
