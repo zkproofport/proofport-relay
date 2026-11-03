@@ -30,6 +30,9 @@ export const SIGNATURE_POLICY = {
   // The wallet signs the request, and the circuit checks that the same key
   // signed its Playground faucet transaction.
   dojang_playground: true,
+  // The nullifier is keccak(wallet ++ circuit tag): the score's wallet signs
+  // the request, as with Coinbase.
+  human_passport_score: true,
   // `satisfies` and not an annotation: an annotation on the const would be
   // checked THROUGH Object.freeze(), which is a generic call and so swallows
   // excess-property checking. That version compiled cleanly with a key the
